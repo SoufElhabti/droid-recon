@@ -24,6 +24,14 @@
 - Sink hits: 367 (**54 outside bundled libraries**)
 - Source hits: 113 (29 outside libraries)
 
+## Dynamic probes
+
+- Observations: **8** (0 flagged interesting)
+- By signal: no_effect=8
+- By reachability: browser=8
+
+> Probes run as the **shell UID**, which holds `START_ANY_ACTIVITY`. A probe that succeeds against a `shell`-only component proves nothing — reachability comes from the manifest, not the exit code.
+
 ## Findings (2)
 
 ### F001 — Custom URL scheme 'humanforce://' registered with no host or path restriction
