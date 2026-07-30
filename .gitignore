@@ -1,0 +1,29 @@
+# --- audit output: NEVER commit ---
+# Session directories hold pulled app private data (shared_prefs, databases),
+# screenshots, and logcat excerpts from real targets. Committing them would leak
+# client/target data into git history.
+sessions/
+targets/
+*.apk
+*.hprof
+*.har
+
+# --- caches ---
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- envs / builds ---
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# --- local ---
+.DS_Store
+*.log
+emulator.log

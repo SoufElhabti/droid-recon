@@ -1,0 +1,16 @@
+Copyright (c) 2026 Poneglyph SARL. All rights reserved.
+
+This software is proprietary and confidential. Unauthorized copying, distribution,
+modification, or use of this software, in whole or in part, by any medium, is strictly
+prohibited without prior written permission from the copyright holder.
+
+Third-party components vendored or invoked by this software are governed by their own
+licenses. See NOTICE.md.
+
+INTENDED USE
+This is offensive security tooling. It is intended solely for authorized security
+testing: applications you own, applications you have written permission to test, or
+targets within the scope of an authorized bug-bounty program or penetration-testing
+engagement. Analysing or instrumenting software you are not authorized to test may
+violate applicable law and the software's terms of service. The copyright holder accepts
+no liability for misuse.

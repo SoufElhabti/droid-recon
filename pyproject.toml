@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "droid-recon"
+version = "0.1.0"
+description = "Android offensive-security audit engine — static attack-surface mapping and dynamic IPC probing"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+droid-recon = "droid_recon.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/droid_recon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
