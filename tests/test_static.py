@@ -260,3 +260,47 @@ def test_extracts_contentprovider_call_methods(tmp_path):
 def test_no_call_methods_when_provider_has_no_call(java_tree):
     out = urimatcher.extract(java_tree, ["com.example.target.open"])
     assert out["call_methods"] == []
+
+
+# ---- device-shell quoting (regression: payloads torn apart at `;`) ----
+
+def test_device_quote_protects_shell_metacharacters():
+    """An intent URI contains `;` — unquoted, the DEVICE shell splits the command."""
+    from droid_recon.shell import _device_quote
+
+    uri = "intent:#Intent;component=com.x/.A;S.k=v;end"
+    q = _device_quote(uri)
+    assert q.startswith("'") and q.endswith("'")
+    assert ";" in q  # preserved, but inside quotes
+
+
+def test_device_quote_leaves_plain_tokens_alone():
+    from droid_recon.shell import _device_quote
+
+    for plain in ("am", "start", "-n", "com.x/.A", "content://a/b", "1.5"):
+        assert _device_quote(plain) == plain
+
+
+def test_device_quote_handles_embedded_single_quotes():
+    from droid_recon.shell import _device_quote
+
+    assert _device_quote("O'Brien") == "'O'\\''Brien'"
+
+
+def test_device_quote_handles_empty_and_spaces():
+    from droid_recon.shell import _device_quote
+
+    assert _device_quote("") == "''"
+    assert _device_quote("a b") == "'a b'"
+
+
+def test_sql_selection_payloads_survive_quoting():
+    """`' OR '1'='1` must reach the provider intact, quotes and all."""
+    from droid_recon.device import payloads as pl
+    from droid_recon.shell import _device_quote
+
+    for sel in pl.sql_injection_selection():
+        q = _device_quote(sel)
+        assert q  # never empty
+        if any(ch in sel for ch in " '\";"):
+            assert q.startswith("'")

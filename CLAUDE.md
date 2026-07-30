@@ -149,6 +149,159 @@ Everything here degrades to a warning + dead-end note rather than aborting the a
 required — **and if you do that, say so in the report**, because it changes the security
 model of every result obtained afterwards.
 
+
+---
+
+## Using it from Claude Code / Codex (MCP)
+
+droid-recon is an MCP stdio server exposing **29 tools**. Register it:
+
+```jsonc
+// Claude Code: .mcp.json   |   Codex: ~/.codex/config.toml equivalent
+{ "mcpServers": {
+    "droid-recon": {
+      "command": "/Users/soufianeelhabti/andagent/.venv/bin/droid-recon",
+      "args": ["mcp"]
+    }}}
+```
+
+Transport is **newline-delimited JSON-RPC 2.0**, the MCP stdio standard — *not* LSP
+`Content-Length` framing. (The prior-art server in `android-privesc-hunt/mcp/` uses LSP
+framing and will not talk to an MCP client; do not copy it.)
+
+Every tool returns a bounded summary plus an `artifact` path. Read the artifact only when
+the summary points somewhere. Call `session_status` any time to see what has been done
+and what to run next.
+
+**Suggested autonomous loop:**
+
+```
+device_up -> static_analyze -> code_analyze
+  -> probe_ipc -> exploit_campaign
+  -> network_setup -> network_capture
+  -> [native] list_native_libs -> native_trace(jni) -> ghidra_analyze
+  -> [authed] app_authenticate -> explore_app -> network_capture again
+  -> build_chains(verify=true) -> triage -> get_report
+```
+
+## Capability map
+
+| Layer | Tools | What it establishes |
+|---|---|---|
+| Static | `static_analyze`, `code_analyze` | Who can reach what; sinks; **provider paths + call() methods from `UriMatcher.addURI`** |
+| Native | `list_native_libs`, `native_trace`, `ghidra_analyze`, `ghidra_decompile` | JNI entry points (incl. dynamically-registered ones invisible to jadx), dangerous imports, embedded secrets |
+| IPC | `probe_ipc`, `send_payload`, `exploit_campaign`, `provider_sqli` | Whether a crafted payload actually lands, verified by the oracle |
+| Network | `network_setup`, `network_capture` | Decrypted HTTPS; cleartext, credentials in traffic, IDOR candidates |
+| UI | `app_authenticate`, `explore_app`, `ui_state`, `tap`, `input_text` | Post-login features that no unauthenticated probe can reach |
+| Synthesis | `build_chains`, `triage`, `get_report` | Cross-layer chains, re-verified by replay |
+
+## The verification oracle
+
+`am start` returns `Status: ok` for almost anything, so "the command ran" is not evidence.
+Each payload declares an expectation up front; the oracle snapshots before/after and
+compares across five sources — logcat, UI tree, process liveness, captured traffic, and a
+per-payload **canary** string.
+
+Verdicts: `confirmed` (our canary provably reached a sink, the canary host was fetched, or
+an expected crash occurred) · `probable` (expected transition or string) · `none`.
+
+Three rules that stop it lying:
+
+1. **A platform denial beats every positive signal.** `Permission Denial` ends the story.
+2. **The command's own echo is stripped before searching.** `am` prints
+   `Starting: Intent {...}` and ActivityManager logs the launch — finding your canary
+   there is your own string handed back, not app behaviour.
+3. **An auth wall is not an auth bypass.** Landing on a gated activity that renders a
+   login form is reported as *not* a bypass, however cleanly `am start` returned.
+
+## Network interception on Android 14
+
+`network_setup` does what the spec's approach cannot. The live trust store on API 34 is
+`/apex/com.android.conscrypt/cacerts` (read-only ext4 from the conscrypt APEX); writing to
+`/system/etc/security/cacerts` changes a directory nothing reads.
+
+The working sequence, all verified on this device:
+
+1. Copy the 134 existing certs to staging, mount a **tmpfs over the APEX cacerts dir**,
+   restore them plus the mitmproxy CA.
+2. Label everything `u:object_r:system_security_cacerts_file:s0`. **This is the step that
+   silently breaks everything if wrong** — a fresh tmpfs gives files `appdomain_tmpfs`,
+   and Conscrypt then ignores a certificate that is present, readable, and correctly
+   hashed, failing with `CertPathValidatorException: Trust anchor ... not found`.
+3. `nsenter` into **zygote's** mount namespace (and every running app's) and repeat,
+   including the relabel. Apps do not share the shell's namespace; without this the store
+   looks patched from `adb shell` and is unchanged for every app.
+
+Measured: 135 certs, overlay active, 78 namespaces patched, and a real
+`HttpsURLConnection` from inside an app decrypted end-to-end with zero handshake failures.
+
+If a capture is empty, `interpretation` says which of the three preconditions failed
+(proxy not reached / CA not trusted / certificate pinned) rather than reporting a bare zero.
+`handshake_failures > 0` with zero flows means pinning — run
+`frida_run(script="ssl_unpin")` first.
+
+## Credentials
+
+`app_authenticate` takes `--credentials <json>` or `DROID_RECON_USER`/`DROID_RECON_PASS`,
+finds the login form by class/resource-id/hint, fills it, submits, and **verifies** we left
+the login screen with no error text. Credential values are redacted from every artifact.
+
+`explore_app` then crawls breadth-first with a structural signature per screen, skipping
+destructive controls (logout, delete, purchase) by design.
+
+## Extra keys come from code, not guesses
+
+`code_analyze` mines `getStringExtra("EXTRA_URL")` / `getIntExtra(K, 0)` literals and
+their constants out of the jadx tree (`static/intents.py`), per component, **with the
+accessor type**. Payloads are then sent with the real key and the right `am` flag.
+
+This is not a refinement — it is the difference between finding the bug and not. On
+`ma.poneglyph.webviewlab`, `StockWebViewActivity` does
+`webView.loadUrl(getIntent().getStringExtra(MainActivity.EXTRA_URL))`. The key is
+literally `"EXTRA_URL"`; a generator guessing `url`/`link`/`target_url` sends seven
+payloads, lands none, and reports a clean run against a direct injection sink. Same
+lesson as provider paths.
+
+## Known limits (v0.2) — measured, not assumed
+
+- **The WebView positive control did not reproduce.** Sending the correct code-derived
+  `EXTRA_URL` with a canary URL, with the emulator booted through `-http-proxy` and the
+  CA installed, did not produce a captured canary request. Other traffic captured fine in
+  the same session, so the plumbing works; the WebView path specifically is unverified.
+  Treat `webview_url_injection` results as **untested** until this control passes — the
+  oracle is trustworthy on crashes and providers, not yet proven on WebView sinks.
+- **Android WebView ignores the runtime proxy setting.** `settings put global http_proxy`
+  is honoured by ordinary HTTP stacks but not by WebView's Chromium network stack. Use
+  `device up --http-proxy 10.0.2.2:8080` (boot-time) if you need WebView traffic. The
+  emulator must be restarted for this to apply.
+- Probes still run as the **shell UID**. `reachable_from` remains a manifest inference; an
+  unprivileged attacker APK making the same calls is still the missing proof step.
+- `explore_app` is heuristic. It will miss flows behind captchas, OTP, biometrics, or
+  custom gesture UIs.
+- `native_trace(exports)` needs the app running and its `.so` loaded; on a spawn use `jni`.
+- Ghidra whole-library decompile is not exposed — only per-function, because it is slow.
+- Chain verification replays adb PoCs only; traffic- and native-anchored chains are built
+  but not re-verified automatically.
+
+
+## False positives this oracle has already produced (and now blocks)
+
+Every one of these was observed on a real run and is pinned by a regression test. They
+are listed because the pattern generalises: **an automated exploit oracle's default
+failure mode is confirming its own artefacts.**
+
+| Observed | Cause | Fix |
+|---|---|---|
+| 14/14 payloads "CONFIRMED" | The intent URI's `;` was split by the *device* shell, `am` threw `No intent supplied`, and the exception echoed our canary back. | Quote every argument for the device shell (`shell._device_quote`); bail on `command_error` before looking for evidence. |
+| 3/14 "probable" | `am start -n pkg/.Foo` moves focus to Foo every time; that was read as "the payload caused a transition". | Landing on the *requested* component is the null result — only a landing elsewhere counts (`landed_on_requested_component`). |
+| Every probe "crashed" | Our own `uiautomator dump` threw `UiAutomationService ... already registered`. | Filter instrumentation crashes by stack **and** by `FATAL EXCEPTION:` thread name. |
+| 3 "credential leak" findings | `errorCallbackToken=null` / `RemoteToken{...}` from WindowManager. | Whole-word key matching + value-shape checks + package attribution + framework-tag exclusion. |
+| Canary "confirmed" from the tool's own echo | `am` prints `Starting: Intent {...}`; ActivityManager logs the launch. | Strip echo lines before searching for canaries. |
+
+The honest current state on `ma.poneglyph.webviewlab` (13 exported activities, an
+intentionally vulnerable WebView lab): **0 confirmed hits from 16 payloads.** That is the
+correct answer for the payloads sent — not a claim the app is secure.
+
 ---
 
 ## Where the spec (`prompt.md`) was wrong
@@ -185,7 +338,7 @@ with explicit `to_dict`/`from_dict` (no pydantic); argparse (no click); bracket-
 binary and `adb shell` against a wedged device blocks forever.
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 97 tests
+.venv/bin/python -m pytest tests/ -q     # 143 tests
 ```
 
 The correctness gate is `tests/fixtures.py` — a hand-built manifest where every component

@@ -14,11 +14,13 @@ import sys
 from pathlib import Path
 
 from . import log, report, shell, triage
-from .device import emulator, install, probes, screen, storage
+from .device import (certs, emulator, exploit, explorer, install, network, payloads,
+                     probes, screen, storage)
 from .log import die, ok, say, warn
 from .models import SessionState
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, manifest, resources, sweep, urimatcher
+from .static import decompile, ghidra, manifest, resources, sweep, urimatcher
+from . import chains as chains_mod
 
 
 # ---- helpers ----
@@ -145,7 +147,8 @@ def cmd_code(args) -> int:
 def cmd_device(args) -> int:
     if args.device_action == "up":
         serial = emulator.boot(args.avd, headless=not args.window,
-                               log_path=Path(args.emulator_log) if args.emulator_log else None)
+                               log_path=Path(args.emulator_log) if args.emulator_log else None,
+                               http_proxy=args.http_proxy)
         if not serial:
             die("emulator failed to become ready", 3)
         rooted = emulator.become_root(serial)
@@ -485,6 +488,235 @@ def cmd_frida(args) -> int:
     return 1
 
 
+
+# ---- mcp ----
+
+def cmd_mcp(args) -> int:
+    from . import mcp_server
+    return mcp_server.serve(Path(args.sessions))
+
+
+# ---- net ----
+
+def cmd_net(args) -> int:
+    serial = _pick_serial(args)
+    if args.net_action == "setup":
+        ca = network.ensure_ca()
+        if not ca:
+            die("could not obtain the mitmproxy CA (is mitmproxy installed?)", 8)
+        good, msg = certs.install_system_ca(ca, serial)
+        _emit({"ok": good, "message": msg, "ca": str(ca),
+               "trust_store": certs.trust_status(serial)})
+        return 0 if good else 8
+
+    if args.net_action == "status":
+        _emit({"trust_store": certs.trust_status(serial),
+               "device_proxy": network.device_proxy(serial),
+               "mitmdump": shell.which("mitmdump")})
+        return 0
+
+    if args.net_action == "reset":
+        certs.remove_system_ca(serial)
+        network.clear_device_proxy(serial)
+        ok("trust-store overlay removed, proxy cleared")
+        return 0
+
+    if args.net_action == "capture":
+        import time
+        session = Session.open(args.package, Path(args.sessions))
+        out = session.dir / "network"
+        cap = network.start_capture(out, port=args.port)
+        if cap is None:
+            die("mitmdump failed to start", 8)
+        network.set_device_proxy(args.port, serial)
+        shell.adb_shell(["am", "broadcast", "-a", "android.intent.action.PROXY_CHANGE"],
+                        serial=serial, timeout=20)
+        if not args.no_launch:
+            shell.adb_shell(["monkey", "-p", args.package, "-c",
+                             "android.intent.category.LAUNCHER", "1"],
+                            serial=serial, timeout=30)
+        say("net", f"capturing for {args.duration}s — exercise the app now")
+        time.sleep(args.duration)
+        cap.stop()
+        network.clear_device_proxy(serial)
+        recs = network.read_flows(cap.flows_path)
+        analysis = network.analyse(recs, args.package)
+        network.export_har(recs, out / "traffic.har")
+        (out / "analysis.json").write_text(json.dumps(analysis, indent=2))
+        ok(analysis["interpretation"])
+        _emit({**analysis, "har": str(out / "traffic.har")})
+        return 0
+    return 1
+
+
+# ---- exploit ----
+
+def cmd_exploit(args) -> int:
+    apks = _resolve_target(args.target)
+    surface = manifest.analyze(apks[0].parent if len(apks) > 1 else apks[0])
+    session = _session_for(surface, args)
+    surface = session.read_surface() or surface
+    serial = _pick_serial(args)
+
+    wanted = set(args.type or ["activity", "receiver", "service"])
+    if "activity" in wanted:
+        wanted.add("activity-alias")
+    comps = [c for c in surface.components
+             if c.type in wanted and c.reachable_from in ("third_party_app", "browser")]
+    if not comps:
+        warn("no third-party-reachable components — nothing an attacker could trigger")
+        _emit({"attempts": 0, "landed": 0})
+        return 0
+
+    # Stream results to disk as they happen. A campaign can run for many minutes;
+    # buffering until the end means an interrupt (or a wedged device) loses everything.
+    path = session.dir / "exploits.jsonl"
+
+    def _persist(att) -> None:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(att.to_dict()) + "\n")
+        session.add_observation(att.to_observation(
+            f"O{session.count_observations() + 1:04d}", surface.package))
+
+    attempts = exploit.run_campaign(
+        surface.package, comps, serial=serial,
+        screenshots_dir=session.screenshots,
+        max_payloads_per_component=args.max_payloads,
+        on_attempt=_persist,
+    )
+    hits = [a for a in attempts if a.verdict.hit]
+    _emit({"package": surface.package, "attempts": len(attempts), "landed": len(hits),
+           "confirmed": sum(1 for a in hits if a.verdict.confidence == "confirmed"),
+           "hits": [a.to_dict() for a in hits][:10], "artifact": str(path)})
+    return 0
+
+
+# ---- ui ----
+
+def cmd_ui(args) -> int:
+    serial = _pick_serial(args)
+    session = Session.open(args.package, Path(args.sessions))
+    if args.ui_action == "auth":
+        if args.username and args.password:
+            creds = explorer.Credentials(args.username, args.password)
+        else:
+            creds = explorer.Credentials.load(args.credentials)
+        shell.adb_shell(["monkey", "-p", args.package, "-c",
+                         "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=30)
+        import time
+        time.sleep(3)
+        _emit(explorer.authenticate(args.package, creds, serial, session.screenshots))
+        return 0
+    if args.ui_action == "explore":
+        res = explorer.explore(args.package, serial, max_screens=args.max_screens,
+                               max_depth=args.max_depth, shots=session.screenshots)
+        (session.dir / "screen_graph.json").write_text(json.dumps(res, indent=2))
+        _emit({**res, "artifact": str(session.dir / "screen_graph.json")})
+        return 0
+    if args.ui_action == "state":
+        xml = screen.ui_tree_xml(serial)
+        shot = screen.capture(session.screenshots, "ui_state", serial)
+        _emit({"focus": screen.current_focus(serial),
+               "elements": screen.ui_summary(xml or "", max_items=60),
+               "screenshot": str(shot) if shot else None})
+        return 0
+    return 1
+
+
+# ---- native ----
+
+def cmd_native(args) -> int:
+    serial = _pick_serial(args)
+    session = Session.open(args.package, Path(args.sessions))
+    if args.native_action == "libs":
+        from .frida import native as native_mod
+        _emit({"shipped": native_mod.list_native_libs(args.package, serial),
+               "loaded": native_mod.loaded_modules(args.package, serial)})
+        return 0
+    if args.native_action == "trace":
+        from .frida import native as native_mod
+        good, res = native_mod.trace(args.package, args.mode, serial=serial,
+                                     modules=args.module, duration=args.duration,
+                                     spawn=not args.attach, out_dir=session.dir / "native")
+        if good:
+            (session.dir / f"native_{args.mode}.json").write_text(json.dumps(res, indent=2))
+        _emit({"ok": good, **res})
+        return 0 if good else 9
+    return 1
+
+
+# ---- ghidra ----
+
+def cmd_ghidra(args) -> int:
+    if not ghidra.available():
+        die("Ghidra analyzeHeadless not found — set GHIDRA_INSTALL_DIR", 10)
+    if args.ghidra_action == "analyze":
+        apks = _resolve_target(args.target)
+        surface = manifest.analyze(apks[0].parent if len(apks) > 1 else apks[0])
+        session = _session_for(surface, args)
+        work = session.dir / "native"
+        libs = ghidra.extract_native_libs(apks[0], work / "libs", args.abi)
+        if not libs:
+            _emit({"libraries": [], "note": f"no native libraries for ABI {args.abi}"})
+            return 0
+        results = []
+        for so in libs[: args.max_libs]:
+            blob = ghidra.analyse(so, work, force=args.force)
+            if blob:
+                results.append({"library": so.name, "functions": blob.get("functions_total"),
+                                "findings": blob.get("findings", {})})
+        (session.dir / "ghidra.json").write_text(json.dumps(results, indent=2))
+        _emit({"libraries_found": [p.name for p in libs], "analysed": results,
+               "artifact": str(session.dir / "ghidra.json")})
+        return 0
+    if args.ghidra_action == "decompile":
+        session = Session.open(args.package or "_scratch", Path(args.sessions))
+        c = ghidra.decompile_function(Path(args.so), args.function, session.dir / "native")
+        _emit({"function": args.function, "ok": bool(c), "c": c or ""})
+        return 0 if c else 10
+    return 1
+
+
+# ---- chains ----
+
+def cmd_chains(args) -> int:
+    session = Session.open(args.package, Path(args.sessions))
+    surface = session.read_surface()
+    if surface is None:
+        die("no attack_surface.json — run `droid-recon static` first", 6)
+    exploits = []
+    ep = session.dir / "exploits.jsonl"
+    if ep.exists():
+        for line in ep.read_text(errors="replace").splitlines():
+            if line.strip():
+                try:
+                    exploits.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    traffic = None
+    tp = session.dir / "network" / "analysis.json"
+    if tp.exists():
+        traffic = json.loads(tp.read_text())
+    native = None
+    gp = session.dir / "ghidra.json"
+    if gp.exists():
+        blobs = json.loads(gp.read_text())
+        if blobs:
+            native = {"program": blobs[0].get("library"), "findings": blobs[0].get("findings")}
+    built = chains_mod.build(surface, code_report=session.read_code_report(),
+                             exploit_attempts=exploits, traffic=traffic, native=native)
+    if not args.no_verify:
+        serial = emulator.running_serial()
+        built = [chains_mod.verify(c, package=args.package, serial=serial) for c in built]
+    (session.dir / "chains.json").write_text(
+        json.dumps([c.to_dict() for c in built], indent=2))
+    ok(f"{len(built)} chain(s), {sum(1 for c in built if c.verified)} verified")
+    _emit({"summary": chains_mod.summarise(built),
+           "chains": [c.to_dict() for c in built][:12],
+           "artifact": str(session.dir / "chains.json")})
+    return 0
+
+
 # ---- parser ----
 
 def build_parser() -> argparse.ArgumentParser:
@@ -525,6 +757,9 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--avd", default="webview_lab")
     up.add_argument("--window", action="store_true", help="show the emulator window")
     up.add_argument("--emulator-log", default=None)
+    up.add_argument("--http-proxy", default=None,
+                    help="route ALL device traffic via a proxy at boot, e.g. 10.0.2.2:8080 "
+                         "— required for WebView traffic, which ignores the runtime setting")
     dsub.add_parser("info", help="device properties")
     dsub.add_parser("list", help="available AVDs and attached devices")
     pk = dsub.add_parser("packages", help="installed packages")
@@ -609,6 +844,85 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("--duration", type=int, default=25, help="collection window in seconds")
     sp.add_argument("--serial", default=None)
     sp.set_defaults(func=cmd_frida)
+
+
+    # mcp
+    sp = sub.add_parser("mcp", help="run as an MCP stdio server (Claude Code / Codex)")
+    sp.set_defaults(func=cmd_mcp)
+
+    # net
+    sp = sub.add_parser("net", help="TLS interception: CA injection and traffic capture")
+    nsub = sp.add_subparsers(dest="net_action", required=True)
+    nsub.add_parser("setup", help="install the mitmproxy CA into the system trust store")
+    nsub.add_parser("status", help="trust store and proxy state")
+    nsub.add_parser("reset", help="remove the trust-store overlay and clear the proxy")
+    ncap = nsub.add_parser("capture", help="capture and analyse app traffic")
+    ncap.add_argument("package")
+    ncap.add_argument("--duration", type=int, default=30)
+    ncap.add_argument("--port", type=int, default=network.DEFAULT_PORT)
+    ncap.add_argument("--no-launch", action="store_true")
+    sp.add_argument("--serial", default=None)
+    sp.set_defaults(func=cmd_net)
+
+    # exploit
+    sp = sub.add_parser("exploit", help="send IPC payloads and verify each with the oracle")
+    add_target(sp)
+    sp.add_argument("--serial", default=None)
+    sp.add_argument("--max-payloads", type=int, default=10)
+    sp.add_argument("--type", action="append",
+                    choices=["activity", "service", "receiver"])
+    sp.set_defaults(func=cmd_exploit)
+
+    # ui
+    sp = sub.add_parser("ui", help="authenticate and explore the app through its real UI")
+    usub = sp.add_subparsers(dest="ui_action", required=True)
+    ua = usub.add_parser("auth", help="log in with credentials and verify")
+    ua.add_argument("package")
+    ua.add_argument("--credentials", default=None, help="JSON file with username/password")
+    ua.add_argument("--username", default=None)
+    ua.add_argument("--password", default=None)
+    ue = usub.add_parser("explore", help="crawl app screens (run after auth)")
+    ue.add_argument("package")
+    ue.add_argument("--max-screens", type=int, default=20)
+    ue.add_argument("--max-depth", type=int, default=3)
+    us = usub.add_parser("state", help="current screen: focus, elements, screenshot")
+    us.add_argument("package")
+    sp.add_argument("--serial", default=None)
+    sp.set_defaults(func=cmd_ui)
+
+    # native
+    sp = sub.add_parser("native", help="native/JNI tracing via Frida")
+    nvsub = sp.add_subparsers(dest="native_action", required=True)
+    nl = nvsub.add_parser("libs", help="shipped and loaded .so libraries")
+    nl.add_argument("package")
+    nt = nvsub.add_parser("trace", help="trace the native layer")
+    nt.add_argument("package")
+    nt.add_argument("--mode", choices=["jni", "libc", "exports"], default="jni")
+    nt.add_argument("--duration", type=int, default=25)
+    nt.add_argument("--module", action="append")
+    nt.add_argument("--attach", action="store_true")
+    sp.add_argument("--serial", default=None)
+    sp.set_defaults(func=cmd_native)
+
+    # ghidra
+    sp = sub.add_parser("ghidra", help="headless Ghidra analysis of native libraries")
+    gsub = sp.add_subparsers(dest="ghidra_action", required=True)
+    ga = gsub.add_parser("analyze", help="JNI entry points, dangerous imports, secrets")
+    ga.add_argument("target")
+    ga.add_argument("--abi", default="arm64-v8a")
+    ga.add_argument("--max-libs", type=int, default=3)
+    ga.add_argument("--force", action="store_true")
+    gd = gsub.add_parser("decompile", help="decompile one function to C")
+    gd.add_argument("so")
+    gd.add_argument("function")
+    gd.add_argument("--package", default=None)
+    sp.set_defaults(func=cmd_ghidra)
+
+    # chains
+    sp = sub.add_parser("chains", help="correlate all layers into attack chains and verify")
+    sp.add_argument("package")
+    sp.add_argument("--no-verify", action="store_true")
+    sp.set_defaults(func=cmd_chains)
 
     return p
 

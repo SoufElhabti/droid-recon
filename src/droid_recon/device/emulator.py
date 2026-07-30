@@ -43,10 +43,21 @@ def running_serial() -> str | None:
 
 
 def boot(avd: str, *, headless: bool = True, log_path: Path | None = None,
-         wipe: bool = False) -> str | None:
-    """Start `avd` and wait until it is genuinely usable. Returns the serial."""
+         wipe: bool = False, http_proxy: str | None = None) -> str | None:
+    """Start `avd` and wait until it is genuinely usable. Returns the serial.
+
+    `http_proxy` (e.g. "10.0.2.2:8080") routes traffic through a proxy at the EMULATOR
+    level. That matters because `settings put global http_proxy` — the runtime method —
+    is honoured by ordinary HTTP stacks but **ignored by Android WebView**, which uses
+    Chromium's own network stack. Verified here: with only the runtime setting, a
+    WebView loading https://example.com produced zero captured flows while other traffic
+    was captured normally. If you need WebView traffic, boot with this.
+    """
     existing = running_serial()
     if existing:
+        if http_proxy:
+            warn(f"device {existing} is already running — the -http-proxy flag only "
+                 f"applies at boot. Shut it down first if you need WebView traffic.")
         say("device", f"reusing running device {existing}")
         return existing if wait_ready(existing) else None
 
@@ -60,6 +71,8 @@ def boot(avd: str, *, headless: bool = True, log_path: Path | None = None,
 
     argv = [exe, "-avd", avd, "-no-audio", "-no-boot-anim",
             "-gpu", "swiftshader_indirect", "-no-snapshot"]
+    if http_proxy:
+        argv += ["-http-proxy", http_proxy if "://" in http_proxy else f"http://{http_proxy}"]
     if headless:
         argv.append("-no-window")
     if wipe:
