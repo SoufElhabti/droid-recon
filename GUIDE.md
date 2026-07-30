@@ -344,6 +344,111 @@ Reproduce any of them:
 droid-recon report ma.poneglyph.webviewlab      # full chains, PoCs, impact, evidence
 ```
 
+
+---
+
+## 7b. Worked example #2 — a hardened target, and why "no findings" is a result
+
+Target: `com.humanforce.mobileapp` 10.5.24 (React Native, 72 MB, 47 native libs).
+Full report: [`docs/example-report-humanforce.md`](docs/example-report-humanforce.md).
+
+The first example found a critical. This one did not — and the discipline that produces
+that answer is the point of the tool.
+
+### What the pipeline established
+
+```bash
+droid-recon static ./Humanforce.apk        # 30 components, only 4 exported
+droid-recon code   ./Humanforce.apk        # 10,131 files swept, 0 secrets
+droid-recon net capture com.humanforce.mobileapp
+```
+
+| Check | Result |
+|---|---|
+| Exported components | 4 of 30 — MainActivity + 2 Firebase receivers + Play Services, all legitimate |
+| Content providers | **all 7 unexported** — no provider surface at all |
+| App Links (`dl.humanforce.com`) | `autoVerify="true"` — the SSO callback **cannot** be hijacked by a competing app |
+| `debuggable` / `allowBackup` / cleartext | all off |
+| Hardcoded secrets | none (see the Hermes note below) |
+| Cognito **Identity** Pools | none — so no unauthenticated AWS-credential path |
+| Google Maps key | scoped to the Maps SDK for Android (correct); returns "API not activated", not "not authorized" |
+| World-readable files | zero |
+| Runtime storage | only an FCM push token in a Play Services file, mode 660 |
+
+Result: **one LOW hardening issue**, no critical or high.
+
+### React Native / Hermes — a gap worth knowing
+
+An RN app's logic is not in the dex. `droid-recon code` swept 10,131 Java files and found
+nothing meaningful, because the app lives in `assets/index.android.bundle` — 8.4 MB of
+**Hermes bytecode**, which the tool does not currently parse.
+
+`strings` is useless on it: Hermes packs its string table as one contiguous blob with no
+NUL separators, so you get 2,800 lines of garbage. The working approach:
+
+```bash
+unzip -o -q app.apk 'assets/*' -d /tmp/x
+# find the string table by entropy — it reads ~100% printable while code blocks read ~30%
+python - <<'EOF'
+import pathlib, collections, math
+d = pathlib.Path('/tmp/x/assets/index.android.bundle').read_bytes()
+for i in range(0, len(d), 65536):
+    b = d[i:i+65536]
+    pr = sum(1 for c in b if 32 <= c < 127)/len(b)
+    if pr > 0.95: print(hex(i), f"{pr:.0%}")   # <-- the string table
+EOF
+# then slice that region out and grep it for endpoints, pool ids, keys
+```
+
+That recovered the real backend surface: `api.humanforce.com/v3`, `api-uk`, `api.us`,
+`api-global`, `apitest`, `api.humanforce-staging.io`, `auth.humanforce.io`, plus AWS
+Amplify/Cognito **User** Pool IDs.
+
+**And a calibration point:** Cognito *User* Pool IDs (`region_XXXXXXXX`) are **public
+identifiers** that every client must ship. Finding them is not a vulnerability. What would
+matter is an *Identity* Pool (`region:uuid`, can mint unauthenticated AWS credentials) or a
+client secret — neither was present. Reporting the User Pool IDs as "hardcoded credentials"
+is a classic inflated finding.
+
+### The deeplink surface, tested rather than assumed
+
+`humanforce://` is registered with **no host, no path, no autoVerify** — strictly broader
+than the `https://dl.humanforce.com/*` filters beside it. That looks promising, so it was
+tested rather than written up:
+
+```
+humanforce://sso-sign-in                                  -> login screen
+humanforce://onboarding                                   -> login screen
+humanforce://home                                         -> login screen
+humanforce://sso-sign-in?url=http://attacker/evil.html    -> login screen
+humanforce://sso-sign-in?token=CANARY&code=CANARY         -> login screen
+https://dl.humanforce.com/sso-sign-in?code=X&state=Y      -> login screen
+```
+
+Six variants, no authentication bypass, no URL injection, no WebView load. So it is
+filed **LOW — hardening**, with the negative evidence recorded in the finding. Writing it
+up as "High: unauthenticated deeplink entry point" would be a false positive: the surface
+is real, the impact is not.
+
+### Where critical/high could still live here
+
+Everything above is the **client-side, pre-authentication** surface, which is what an APK
+plus an emulator can reach. Not covered, and requiring authorization from the vendor:
+
+- The authenticated `api.humanforce.com/v3` surface — IDOR/BOLA on employee, roster,
+  timesheet and payroll objects is where a workforce product's real risk sits.
+- The SSO flow end-to-end against the live IdP.
+- `api.humanforce-staging.io` and `apitest.humanforce.com` — non-production hosts
+  referenced by a production build are worth checking for weaker controls.
+
+Do that under a disclosure programme or a written engagement, not off a downloaded APK.
+
+### The lesson
+
+A tool that always finds something is a tool that always lies. Two targets, same
+pipeline: one produced a proven critical with an exfiltrated file, the other produced a
+single LOW after every promising lead was tested and fell over. Both are correct outputs.
+
 ---
 
 ## 8. Network interception on Android 14 — what actually works
@@ -390,6 +495,9 @@ All of it is destroyed on reboot — it is a per-session operation. Re-run `net 
   but not automatically re-verified.
 - `ui explore` is heuristic — it will miss flows behind captcha, OTP, biometrics, or
   custom gesture UIs.
+- **React Native / Hermes bundles are not parsed.** `code` sweeps the dex, but an RN app's
+  logic is Hermes bytecode in `assets/index.android.bundle`. Use the entropy-slice recipe
+  in §7b until this is built in. Flutter (`libapp.so`) has the same gap.
 
 ## 10. Troubleshooting
 
