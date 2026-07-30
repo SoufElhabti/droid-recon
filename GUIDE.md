@@ -375,7 +375,21 @@ droid-recon net capture com.humanforce.mobileapp
 | World-readable files | zero |
 | Runtime storage | only an FCM push token in a Play Services file, mode 660 |
 
-Result: **one LOW hardening issue**, no critical or high.
+Result: **one LOW, one MEDIUM**, no critical or high — after covering every client-side
+layer the tool has:
+
+| Layer | Covered | Outcome |
+|---|---|---|
+| Manifest / components | ✓ | 4 of 30 exported, all legitimate |
+| Content providers | ✓ | all 7 unexported |
+| App Links | ✓ | `autoVerify="true"` |
+| Deeplinks (6 variants, dynamic) | ✓ | all terminate on the login wall |
+| dex sweep (10,131 files) | ✓ | 0 secrets; every sink sits in an OSS dependency |
+| Hermes bundle | ✓ | no secrets, no Identity Pools |
+| WebView config | ✓ | `allowUniversalAccessFromFileURLs` absent; `originWhitelist` used |
+| Storage | ✓ | 0 world-readable; only an FCM token |
+| Network capture | ✓ | 3 flows, no cleartext, no secrets in transit |
+| **Native (47 libs, Ghidra)** | ✓ | **all stock RN/Crashlytics/uCrop — no app-authored native code, 0 secrets** |
 
 ### React Native / Hermes — a gap worth knowing
 

@@ -24,7 +24,7 @@
 - Sink hits: 367 (**54 outside bundled libraries**)
 - Source hits: 113 (29 outside libraries)
 
-## Findings (1)
+## Findings (2)
 
 ### F001 — Custom URL scheme 'humanforce://' registered with no host or path restriction
 
@@ -42,6 +42,23 @@
 **PoC:** `adb shell am start -a android.intent.action.VIEW -d 'humanforce://sso-sign-in?token=X'`
 
 **Impact:** Hardening only, on the evidence gathered. A scheme-only filter is a strictly larger attack surface than the host-scoped App Links beside it, and any future route added to the RN router inherits unauthenticated, remotely-reachable exposure. No exploitable behaviour was demonstrated: every probe landed on the login wall.
+
+### F002 — No certificate pinning — app traffic is fully readable and modifiable with a device-trusted CA
+
+**MEDIUM** · local-zero-click · reach: `third_party_app` · confidence 95% · CWE-295: Improper Certificate Validation
+
+**Component:** `com.humanforce.mobileapp` (application)
+
+**Chain:**
+
+1. Attacker obtains a CA in the device trust store (MDM, malicious profile, rooted/compromised device, or a compromised public CA)
+2. No pinning means the app accepts it for api.humanforce.com, api-global.humanforce.com and analytics hosts
+3. VERIFIED: all captured traffic decrypted cleanly with zero handshake failures
+4. Attacker reads and rewrites API requests and responses, including the login POST and session tokens
+
+**PoC:** `droid-recon net setup && droid-recon net capture com.humanforce.mobileapp --duration 30`
+
+**Impact:** For a workforce product handling rosters, timesheets and pay data, an attacker with a trusted-CA position reads and modifies all API traffic including credentials and session tokens. Rated MEDIUM, not HIGH, because it requires the attacker to already hold a trusted-CA position — it is a defence-in-depth failure, not a directly exploitable flaw.
 
 ## Artifacts
 
