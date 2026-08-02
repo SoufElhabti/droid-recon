@@ -138,6 +138,29 @@ provider authorities, FileProvider paths, and a triage verdict:
 - `LOW — …all signature-guarded` → stop unless you hold the signing key.
 - `INVESTIGATE — N third-party-reachable, …` → continue.
 
+### Corpus — getting APKs to scan
+
+droid-recon analyses APKs but deliberately ships no default source; every corpus
+has its own terms, and the key is always yours.
+
+```bash
+export ANDROZOO_API_KEY=...                     # request at androzoo.uni.lu/access
+droid-recon corpus index --out /data/androzoo-latest.csv.gz     # multi-GB, cached
+droid-recon corpus fetch --index /data/androzoo-latest.csv.gz \
+    --packages-file targets.txt --out /data/apk-corpus
+droid-recon lottie scan /data/apk-corpus
+```
+
+Resolution prefers Play-sourced rows over third-party markets and takes the newest
+version code within a market. Every download is hash-verified and a mismatch is
+**deleted**, not kept — a corpus that silently serves the wrong bytes would poison
+every finding downstream.
+
+**Provenance limit, and it matters.** AndroZoo is a research snapshot, not the
+vendor's current artifact. A hit is a *lead*. Before reporting anything to a vendor,
+re-acquire the APK from a real install and re-verify the hash: a memory-corruption
+report filed against a stale or third-party binary is trivially dismissed.
+
 ### Lottie corpus triage — pick targets before spending a `code` run
 
 ```bash
