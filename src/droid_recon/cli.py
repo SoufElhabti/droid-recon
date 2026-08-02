@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -635,6 +636,56 @@ def cmd_ui(args) -> int:
 
 # ---- native ----
 
+def cmd_corpus(args) -> int:
+    """Acquire APKs from an operator-configured corpus.
+
+    Kept separate from analysis on purpose: every source has its own terms, and
+    the key is always supplied by the operator rather than embedded.
+    """
+    from .corpus import androzoo
+
+    if args.corpus_action == "index":
+        dest = Path(args.out)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and not args.force:
+            _emit({"index": str(dest), "cached": True})
+            return 0
+        import urllib.request, urllib.error
+        try:
+            with urllib.request.urlopen(androzoo.INDEX_URL, timeout=args.timeout) as resp:
+                with dest.open("wb") as fh:
+                    while True:
+                        chunk = resp.read(1 << 22)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            _emit({"error": f"index download failed: {exc}"})
+            return 1
+        _emit({"index": str(dest), "bytes": dest.stat().st_size})
+        return 0
+
+    if args.corpus_action == "fetch":
+        key = args.key or os.environ.get("ANDROZOO_API_KEY")
+        if not key:
+            _emit({"error": "no API key — pass --key or set ANDROZOO_API_KEY"})
+            return 2
+        packages = list(args.package or [])
+        if args.packages_file:
+            packages += [ln.strip() for ln in Path(args.packages_file).read_text().splitlines()
+                         if ln.strip() and not ln.startswith("#")]
+        if not packages:
+            _emit({"error": "no packages — pass --package or --packages-file"})
+            return 2
+        index = Path(args.index)
+        if not index.is_file():
+            _emit({"error": f"index not found: {index} (run `corpus index` first)"})
+            return 2
+        _emit(androzoo.fetch_packages(index, packages, key, Path(args.out)))
+        return 0
+    return 2
+
+
 def cmd_lottie(args) -> int:
     """Batch-triage a corpus for the exploitable Lottie stack.
 
@@ -939,6 +990,21 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("package")
     sp.add_argument("--serial", default=None)
     sp.set_defaults(func=cmd_ui)
+
+    # corpus
+    sp = sub.add_parser("corpus", help="acquire APKs from an operator-configured corpus")
+    csub = sp.add_subparsers(dest="corpus_action", required=True)
+    ci = csub.add_parser("index", help="download the AndroZoo index (multi-GB, cached)")
+    ci.add_argument("--out", default="./androzoo-latest.csv.gz")
+    ci.add_argument("--force", action="store_true")
+    ci.add_argument("--timeout", type=int, default=3600)
+    cf = csub.add_parser("fetch", help="resolve package names and download, hash-verified")
+    cf.add_argument("--index", default="./androzoo-latest.csv.gz")
+    cf.add_argument("--key", default=None, help="AndroZoo API key (or $ANDROZOO_API_KEY)")
+    cf.add_argument("--package", action="append", help="repeatable")
+    cf.add_argument("--packages-file", default=None, help="one package name per line")
+    cf.add_argument("--out", default="./apk-corpus")
+    sp.set_defaults(func=cmd_corpus)
 
     # lottie
     sp = sub.add_parser("lottie", help="batch-triage APKs for the exploitable Lottie stack")
