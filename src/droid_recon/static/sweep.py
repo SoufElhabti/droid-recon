@@ -42,6 +42,7 @@ class CodeReport:
     local_servers: list[Hit] = field(default_factory=list)
     secrets: list[Hit] = field(default_factory=list)
     provider_paths: dict = field(default_factory=dict)
+    lottie: dict = field(default_factory=dict)
     files_scanned: int = 0
 
     def app_only(self, hits: list[Hit]) -> list[Hit]:
@@ -55,6 +56,7 @@ class CodeReport:
             "local_servers": [h.to_dict() for h in self.local_servers],
             "secrets": [h.to_dict() for h in self.secrets],
             "provider_paths": self.provider_paths,
+            "lottie": self.lottie,
             "summary": self.summary(),
         }
 
@@ -68,6 +70,10 @@ class CodeReport:
             "local_servers": len(self.local_servers),
             "secrets": len(self.secrets),
             "provider_authorities_with_paths": len(self.provider_paths.get("paths", {})),
+            "lottie_stacks": (self.lottie.get("summary") or {}).get("stacks_present", []),
+            "lottie_attacker_influenced_delivery": bool(
+                (self.lottie.get("summary") or {}).get("attacker_influenced_delivery")
+            ),
         }
 
 

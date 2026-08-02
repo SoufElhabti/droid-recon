@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "droid-recon": {
+      "command": "./.venv/bin/droid-recon",
+      "args": ["mcp"]
+    }
+  }
+}

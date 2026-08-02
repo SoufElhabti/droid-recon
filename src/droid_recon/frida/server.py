@@ -10,8 +10,9 @@ note rather than aborting the audit. Development rule 9: fail open on non-critic
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import lzma
-import shutil
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -130,9 +131,46 @@ _FRIDA_ERRORS = (
 )
 
 
+def output_excerpt(output: str, limit: int = 6000) -> str:
+    """Keep both startup hooks and late events while bounding terminal/MCP output."""
+    if len(output) <= limit:
+        return output
+    notice = "\n... middle omitted; see artifact ...\n"
+    available = max(0, limit - len(notice))
+    head = available // 2
+    tail = available - head
+    suffix = output[-tail:] if tail else ""
+    return output[:head] + notice + suffix
+
+
+def persist_output(output: str, out_dir: Path, label: str) -> Path | None:
+    """Persist a complete Frida transcript under a collision-resistant filename."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-.")[:80] or "frida"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    path = out_dir / f"{safe}-{stamp}.log"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(output + ("\n" if output and not output.endswith("\n") else ""),
+                        encoding="utf-8")
+    except OSError as exc:
+        warn(f"could not persist Frida output: {exc}")
+        return None
+    return path
+
+
+def _has_cli_error(output: str) -> bool:
+    # Match Frida's own diagnostic lines, not words inside instrumented app events. A
+    # Lottie payload or stack can legitimately contain strings such as "Unable to parse".
+    return any(
+        line.lstrip().startswith(marker)
+        for line in output.splitlines()
+        for marker in _FRIDA_ERRORS
+    )
+
+
 def run_script(package: str, script: Path, serial: str | None = None, *,
                spawn: bool = True, duration: int = 20) -> tuple[bool, str]:
-    """Run `script` against `package` for `duration` seconds and return its output."""
+    """Run a script and return its complete output; callers persist/bound presentation."""
     exe = shell.which("frida")
     if not exe:
         return False, "frida CLI not found"
@@ -150,8 +188,8 @@ def run_script(package: str, script: Path, serial: str | None = None, *,
     proc = shell.run(argv, timeout=duration + 15)
     output = (proc.stdout + proc.stderr).strip()
 
-    if any(marker in output for marker in _FRIDA_ERRORS):
-        return False, output[:800]
     if proc.timed_out:
-        return False, f"frida did not exit within {duration + 15}s\n{output[:600]}"
-    return True, output[:8000]
+        return False, f"frida did not exit within {duration + 15}s\n{output}"
+    if not proc.ok or _has_cli_error(output):
+        return False, output or f"frida exited with status {proc.rc}"
+    return True, output

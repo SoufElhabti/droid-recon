@@ -33,7 +33,7 @@ from .frida import native as native_mod
 from .frida import server as frida_server
 from .models import Component
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, ghidra, manifest, resources, sweep, urimatcher
+from .static import decompile, ghidra, lottie, manifest, resources, sweep, urimatcher
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "droid-recon", "version": "0.2.0"}
@@ -176,8 +176,8 @@ def _static_analyze(args: dict) -> dict:
 @tool("code_analyze",
       "Decompile with jadx (cached by APK hash, ~15s/18MB) and sweep for sinks/sources, "
       "hardcoded secrets, and — most importantly — ContentProvider URI paths and call() "
-      "methods recovered from UriMatcher.addURI literals. Provider probing barely works "
-      "without this.",
+      "methods recovered from UriMatcher.addURI literals. Also fingerprints Lottie "
+      "stacks and Q1-Q10 delivery signals using obfuscation-resistant strings.",
       _obj({"target": _S, "force": _B, "top": _I}, ["target"]))
 def _code_analyze(args: dict) -> dict:
     surface, apks = _surface_for(args["target"])
@@ -189,6 +189,7 @@ def _code_analyze(args: dict) -> dict:
     code = sweep.sweep(tree, surface)
     auths = sorted({a for c in surface.components for a in c.authorities})
     code.provider_paths = urimatcher.extract(tree, auths)
+    code.lottie = lottie.analyze(tree, apks)
     doc = code.to_dict()
     doc["focused"] = sweep.focused(code, surface, top_n=args.get("top", 40))
     doc["verdict"] = sweep.verdict(surface, code)
@@ -199,9 +200,55 @@ def _code_analyze(args: dict) -> dict:
         "summary": code.summary(),
         "provider_paths": code.provider_paths.get("paths", {}),
         "provider_call_methods": code.provider_paths.get("call_methods", []),
+        "lottie": lottie.brief(code.lottie),
         "focused_sinks": doc["focused"].get("sinks", [])[:15],
         "secrets": doc["focused"].get("secrets", [])[:10],
         "artifact": str(sess.code_path),
+    }
+
+
+@tool("lottie_scan",
+      "Batch-triage a corpus of APKs for the exploitable Lottie stack, ranked. "
+      "Archive-only — no jadx, no device — so it is seconds per APK and is meant to "
+      "pick which targets deserve a full code_analyze. Verdict "
+      "'dotlottie_native_expressions_b64' means the dotLottie native player, the ThorVG "
+      "expression engine and the base64 raw-write sink are all present in the same ELF, "
+      "i.e. the preconditions for the cross-player expression UAF are structurally there. "
+      "Presence is not exploitability: confirm the app actually renders untrusted "
+      "animation content before treating a candidate as a finding.",
+      _obj({"targets": {"type": "array", "items": _S}, "installed": _B, "out": _S},
+           []))
+def _lottie_scan(args: dict) -> dict:
+    targets: dict[str, list[Path]] = {}
+    if args.get("installed"):
+        from .device import install as install_mod
+        out = Path(args.get("out") or "./apk-corpus")
+        out.mkdir(parents=True, exist_ok=True)
+        for pkg in install_mod.list_packages(None, third_party_only=True):
+            dest = out / pkg
+            dest.mkdir(parents=True, exist_ok=True)
+            local = install_mod.pull_installed_apk(pkg, dest, None)
+            if local:
+                targets[pkg] = local
+    for raw in args.get("targets") or []:
+        path = Path(raw)
+        if path.is_dir():
+            apks = sorted(path.glob("*.apk"))
+            if apks:
+                targets[path.name] = apks
+        elif path.is_file():
+            targets[path.name] = [path]
+    if not targets:
+        return {"ok": False, "error": "no targets — pass `targets` or set `installed`"}
+    result = lottie.scan_many(targets)
+    return {
+        "scanned": result["scanned"],
+        "candidates": result["candidates"],
+        "counts": result["counts"],
+        "errors": result["errors"],
+        "results": result["results"][:40],
+        "next": ("code_analyze on each candidate, then frida_run(script='lottie_tracer') "
+                 "to establish whether the animation bytes are attacker-influenced"),
     }
 
 
@@ -474,7 +521,8 @@ def _frida_setup(args: dict) -> dict:
 @tool("frida_run",
       "Run a Frida script against a package. Built-ins: ssl_unpin (defeat certificate "
       "pinning before a capture), crypto_logger (keys/IVs/algorithms), webview_hooks "
-      "(loadUrl / addJavascriptInterface / file-access settings).",
+      "(loadUrl / addJavascriptInterface / file-access settings), lottie_tracer "
+      "(composition sources plus sanitized arguments and Java call stacks).",
       _obj({"package": _S, "script": _S, "duration": _I, "attach": _B}, ["package"]))
 def _frida_run(args: dict) -> dict:
     serial = emulator.running_serial()
@@ -484,7 +532,14 @@ def _frida_run(args: dict) -> dict:
     good, out = frida_server.run_script(args["package"], path, serial,
                                         spawn=not args.get("attach", False),
                                         duration=args.get("duration", 25))
-    return {"ok": good, "script": str(path), "output": out[:6000]}
+    sess = _session(args["package"])
+    artifact = frida_server.persist_output(out, sess.dir / "frida", path.stem)
+    return {
+        "ok": good,
+        "script": str(path),
+        "output": frida_server.output_excerpt(out, 6000),
+        "artifact": str(artifact) if artifact else None,
+    }
 
 
 @tool("native_trace",

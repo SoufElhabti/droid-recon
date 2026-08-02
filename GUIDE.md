@@ -36,19 +36,47 @@ git clone https://github.com/SoufElhabti/droid-recon && cd droid-recon
 uv venv --python 3.12 .venv
 uv pip install -e ".[dev]"
 uv pip install mitmproxy            # optional: network interception
-.venv/bin/python -m pytest tests/ -q # 143 tests
+.venv/bin/python -m pytest tests/ -q
 ```
+
+Runs on **macOS and Linux**. Zero third-party runtime dependencies — Python >= 3.11
+stdlib only — and there is no platform branching anywhere in the source.
 
 **External tools** (found automatically; each degrades gracefully if absent):
 
-| Tool | Needed for | Install |
-|---|---|---|
-| Android SDK (`adb`, `emulator`, `apkanalyzer`) | everything | `brew install --cask android-commandlinetools` |
-| `jadx` | code sweep, provider paths, extra keys | `brew install jadx` |
-| `apktool` | FileProvider paths, network security config | `brew install apktool` |
-| `frida` | instrumentation, native tracing | `pip install frida-tools` |
-| `ghidra` | native binary analysis | `brew install ghidra` |
-| `mitmproxy` | traffic capture | `uv pip install mitmproxy` |
+| Tool | Needed for | macOS | Linux |
+|---|---|---|---|
+| Android SDK (`adb`, `emulator`, `apkanalyzer`) | everything | `brew install --cask android-commandlinetools` | Android Studio, or `sdkmanager` from the command-line tools |
+| `jadx` | code sweep, provider paths, extra keys | `brew install jadx` | distro package, or unpack the release |
+| `apktool` | FileProvider paths, network security config | `brew install apktool` | `apt install apktool` |
+| `frida` | instrumentation, native tracing | `pip install frida-tools` | `pip install frida-tools` |
+| `ghidra` | native binary analysis | `brew install ghidra` | unpack to `/opt/ghidra` |
+| `mitmproxy` | traffic capture | `uv pip install mitmproxy` | `uv pip install mitmproxy` |
+
+Discovery order is `ANDROID_HOME` / `ANDROID_SDK_ROOT`, then `PATH`, then the venv's
+`bin/`, then the SDK layout. Ghidra reads `GHIDRA_INSTALL_DIR` first. Setting those two
+environment variables is enough on any host; the built-in path guesses cover the usual
+Linux (`~/Android/Sdk`, `/usr/lib/android-sdk`, `/opt/android-sdk`) and macOS locations.
+
+### Linux notes
+
+```bash
+sudo apt install openjdk-21-jdk unzip
+export ANDROID_HOME=$HOME/Android/Sdk
+export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+```
+
+The emulator needs KVM rather than macOS's HVF, which is the one thing that actually
+bites:
+
+```bash
+sudo usermod -aG kvm $USER      # then log out and back in
+```
+
+Inside a cloud VM you additionally need nested virtualisation enabled, otherwise the
+emulator silently falls back to software rendering and a ~23 s boot becomes minutes.
+Any stock JDK 17/21 works — the GraalVM pin in the Lottie research rig is a workaround
+for a specific macOS host, not a requirement of this tool.
 
 Check what's live: `droid-recon device list` and the `device_status` MCP tool.
 
@@ -110,13 +138,37 @@ provider authorities, FileProvider paths, and a triage verdict:
 - `LOW — …all signature-guarded` → stop unless you hold the signing key.
 - `INVESTIGATE — N third-party-reachable, …` → continue.
 
+### Lottie corpus triage — pick targets before spending a `code` run
+
+```bash
+droid-recon lottie scan ./apk-corpus            # a directory of APKs, or explicit files
+droid-recon lottie scan --installed             # pull + scan every third-party package
+```
+
+Archive-only: no jadx, no decompilation, nothing executed — just zip and string
+scanning, so it is safe to point at untrusted APKs and costs ~0.3 s each. Measured: 17
+installed packages pulled and ranked in 5 s.
+
+Results are ranked by how exploitable the Lottie stack is. The top verdict,
+`dotlottie_native_expressions_b64`, means the dotLottie native player, the ThorVG
+expression engine and the base64 raw-write sink all occur in the **same ELF** — the
+structural preconditions for the cross-player expression use-after-free.
+
+**Presence is not exploitability.** A candidate only becomes a finding once the app is
+shown to render animation bytes an attacker can influence, so follow up with
+`code` and `frida run --script lottie_tracer` on the survivors. Apps carrying only
+dotLottie *format* markers, or lottie-android / rlottie, rank below and are not
+candidates — those stacks have no expression engine at all.
+
+The `lottie_scan` MCP tool exposes the same sweep.
+
 ### Code — the step that makes exploitation work
 
 ```bash
 droid-recon code ./target.apk                # jadx (cached by APK sha256, ~15s/18MB)
 ```
 
-Sink/source sweep with library-noise filtering, plus two extractions that are the
+Sink/source sweep with library-noise filtering, plus three extractions that are the
 difference between finding a bug and not:
 
 - **Provider URI paths and `call()` methods** from `UriMatcher.addURI` literals.
@@ -126,6 +178,13 @@ difference between finding a bug and not:
   guessing `url`/`link`/`target_url` lands nothing and reports a clean run against a
   direct `loadUrl()` sink. Types matter too: a key read via `getIntExtra` receives
   nothing when sent with `--es`.
+- **Lottie Q1-Q10 fingerprinting and local delivery-path evidence.** This finds
+  obfuscated lottie-android from stable parser strings, lottie-web/dotLottie assets,
+  and rlottie forks even when their shared object is renamed (for example
+  `libdsti.so`, via rlottie ABI symbols and its Java native wrapper). It also identifies
+  stripped or renamed dotLottie-native/ThorVG expression builds when the dotLottie C API
+  and multiple expression-runtime markers occur in the same ELF. Presence is reported
+  separately from attacker-influenced delivery and still requires runtime confirmation.
 
 ### IPC probing and exploitation
 
@@ -159,7 +218,7 @@ Reports **why** a capture is empty rather than a bare zero:
 
 ```bash
 droid-recon frida setup                      # version-matched frida-server, auto-fetched
-droid-recon frida run com.target.app --script ssl_unpin   # or crypto_logger, webview_hooks
+droid-recon frida run com.target.app --script ssl_unpin   # crypto_logger, webview_hooks, lottie_tracer
 droid-recon native libs com.target.app
 droid-recon native trace com.target.app --mode jni        # jni | libc | exports
 ```
@@ -167,6 +226,12 @@ droid-recon native trace com.target.app --mode jni        # jni | libc | exports
 `--mode jni` recovers the Java↔native mapping **including dynamically-registered methods
 that appear nowhere in jadx output**. Start there; its output tells you which modules
 justify the cost of `exports`.
+
+`lottie_tracer` observes lottie-android composition factories, LottieFiles dotLottie
+JNI data/string loads, and Telegram/Samsung rlottie wrapper paths (`createWithJson`,
+file/view setup, and sticker URLs). Arguments are bounded and secret-redacted; streams
+are never consumed by the tracer. The terminal and MCP response keep a bounded head/tail
+while the complete transcript is saved under `sessions/<package>/frida/`.
 
 ### Ghidra
 

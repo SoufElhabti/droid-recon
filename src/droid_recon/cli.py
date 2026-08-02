@@ -19,7 +19,7 @@ from .device import (certs, emulator, exploit, explorer, install, network, paylo
 from .log import die, ok, say, warn
 from .models import SessionState
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, ghidra, manifest, resources, sweep, urimatcher
+from .static import decompile, ghidra, lottie, manifest, resources, sweep, urimatcher
 from . import chains as chains_mod
 
 
@@ -118,6 +118,7 @@ def cmd_code(args) -> int:
     code = sweep.sweep(tree, surface)
     authorities = sorted({a for c in surface.components for a in c.authorities})
     code.provider_paths = urimatcher.extract(tree, authorities)
+    code.lottie = lottie.analyze(tree, apks)
 
     doc = code.to_dict()
     doc["focused"] = sweep.focused(code, surface, top_n=args.top)
@@ -136,6 +137,7 @@ def cmd_code(args) -> int:
         "verdict": doc["verdict"],
         "summary": code.summary(),
         "provider_paths": code.provider_paths.get("paths", {}),
+        "lottie": lottie.brief(code.lottie),
         "focused": doc["focused"],
         "artifact": str(session.code_path),
     })
@@ -482,7 +484,15 @@ def cmd_frida(args) -> int:
         succeeded, output = frida_server.run_script(
             args.package, script, serial, spawn=not args.attach, duration=args.duration
         )
-        _emit({"ok": succeeded, "script": str(script), "output": output})
+        session = Session.open(args.package, Path(args.sessions))
+        artifact = frida_server.persist_output(
+            output, session.dir / "frida", script.stem)
+        _emit({
+            "ok": succeeded,
+            "script": str(script),
+            "output": frida_server.output_excerpt(output, 8000),
+            "artifact": str(artifact) if artifact else None,
+        })
         return 0 if succeeded else 7
 
     return 1
@@ -625,6 +635,44 @@ def cmd_ui(args) -> int:
 
 # ---- native ----
 
+def cmd_lottie(args) -> int:
+    """Batch-triage a corpus for the exploitable Lottie stack.
+
+    Deliberately archive-only: no jadx, no device.  The point is to spend
+    seconds per APK deciding which targets deserve a full `code` run.
+    """
+    from .static import lottie as lottie_mod
+
+    targets: dict[str, list[Path]] = {}
+    if args.installed:
+        serial = _pick_serial(args)
+        from .device import install as install_mod
+        pulled = Path(args.out)
+        pulled.mkdir(parents=True, exist_ok=True)
+        for pkg in install_mod.list_packages(serial, third_party_only=True):
+            dest = pulled / pkg
+            dest.mkdir(parents=True, exist_ok=True)
+            local = install_mod.pull_installed_apk(pkg, dest, serial)
+            if local:
+                targets[pkg] = local
+    for raw in args.target or []:
+        path = Path(raw)
+        if path.is_dir():
+            apks = sorted(path.glob("*.apk"))
+            if apks:
+                targets[path.name] = apks
+        elif path.is_file():
+            targets[path.name] = [path]
+
+    if not targets:
+        _emit({"error": "no targets — pass APK paths/directories or --installed"})
+        return 2
+
+    result = lottie_mod.scan_many(targets)
+    _emit(result)
+    return 0
+
+
 def cmd_native(args) -> int:
     serial = _pick_serial(args)
     session = Session.open(args.package, Path(args.sessions))
@@ -743,7 +791,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_static)
 
     # code
-    sp = sub.add_parser("code", help="jadx decompile + sink/source sweep + provider paths")
+    sp = sub.add_parser(
+        "code", help="jadx sweep + provider paths + Lottie fingerprint (Q1-Q10)")
     add_target(sp)
     sp.add_argument("--force", action="store_true", help="ignore the jadx cache")
     sp.add_argument("--timeout", type=int, default=decompile.JADX_TIMEOUT)
@@ -839,7 +888,8 @@ def build_parser() -> argparse.ArgumentParser:
     fr = fsub.add_parser("run", help="run a script against a package")
     fr.add_argument("package")
     fr.add_argument("--script", default="ssl_unpin",
-                    help="built-in name (ssl_unpin, crypto_logger, webview_hooks) or a path")
+                    help="built-in name (ssl_unpin, crypto_logger, webview_hooks, "
+                         "lottie_tracer) or a path")
     fr.add_argument("--attach", action="store_true", help="attach instead of spawn")
     fr.add_argument("--duration", type=int, default=25, help="collection window in seconds")
     sp.add_argument("--serial", default=None)
@@ -889,6 +939,17 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("package")
     sp.add_argument("--serial", default=None)
     sp.set_defaults(func=cmd_ui)
+
+    # lottie
+    sp = sub.add_parser("lottie", help="batch-triage APKs for the exploitable Lottie stack")
+    lsub = sp.add_subparsers(dest="lottie_action", required=True)
+    ls = lsub.add_parser("scan", help="fingerprint a corpus, ranked by exploitability")
+    ls.add_argument("target", nargs="*", help="APK files or directories of APKs")
+    ls.add_argument("--installed", action="store_true",
+                    help="pull and scan every third-party package on the device")
+    ls.add_argument("--out", default="./apk-corpus", help="where --installed pulls to")
+    ls.add_argument("--serial", default=None)
+    sp.set_defaults(func=cmd_lottie)
 
     # native
     sp = sub.add_parser("native", help="native/JNI tracing via Frida")

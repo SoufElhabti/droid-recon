@@ -76,6 +76,11 @@ def android_home() -> Path | None:
         if val and Path(val).is_dir():
             return Path(val)
     for guess in (
+        # Linux
+        Path.home() / "Android/Sdk",              # Android Studio default
+        Path("/usr/lib/android-sdk"),             # Debian/Ubuntu package
+        Path("/opt/android-sdk"),                 # Arch and most manual installs
+        # macOS
         Path("/opt/homebrew/share/android-commandlinetools"),
         Path.home() / "Library/Android/sdk",
     ):
