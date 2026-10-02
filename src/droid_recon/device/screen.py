@@ -23,30 +23,41 @@ def _stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
-def capture(dest_dir: Path, label: str, serial: str | None = None) -> Path | None:
+def capture(dest_dir: Path, label: str, serial: str | None = None,
+            *, agent=None) -> Path | None:
     """screencap on device, then pull. Returns the local path, or None on failure."""
+    from ..device_agent.runtime import exec_on_device
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:80]
     local = dest_dir / f"{_stamp()}_{safe}.png"
 
-    cap = shell.adb_shell(["screencap", "-p", REMOTE_PNG], serial=serial, timeout=45)
+    cap = exec_on_device(["screencap", "-p", REMOTE_PNG],
+                         agent=agent, serial=serial, timeout=45)
     if not cap.ok:
         return None
-    shell.adb("pull", REMOTE_PNG, str(local), serial=serial, timeout=60)
-    shell.adb_shell(["rm", "-f", REMOTE_PNG], serial=serial, timeout=20)
+
+    if agent:
+        data = agent.read_file(REMOTE_PNG, timeout=60)
+        if data:
+            local.write_bytes(data)
+    else:
+        shell.adb("pull", REMOTE_PNG, str(local), serial=serial, timeout=60)
+    exec_on_device(["rm", "-f", REMOTE_PNG], agent=agent, serial=serial, timeout=20)
 
     if local.exists() and local.stat().st_size > 0:
         return local
     return None
 
 
-def ui_tree_xml(serial: str | None = None) -> str | None:
+def ui_tree_xml(serial: str | None = None, *, agent=None) -> str | None:
     """Raw uiautomator dump. Fails on some transient screens — that is survivable."""
-    proc = shell.adb_shell(["uiautomator", "dump", REMOTE_UI], serial=serial, timeout=60)
+    from ..device_agent.runtime import exec_on_device
+    proc = exec_on_device(["uiautomator", "dump", REMOTE_UI],
+                          agent=agent, serial=serial, timeout=60)
     if "ERROR" in proc.stdout or not proc.ok:
         return None
-    cat = shell.adb_shell(["cat", REMOTE_UI], serial=serial, timeout=30)
-    shell.adb_shell(["rm", "-f", REMOTE_UI], serial=serial, timeout=20)
+    cat = exec_on_device(["cat", REMOTE_UI], agent=agent, serial=serial, timeout=30)
+    exec_on_device(["rm", "-f", REMOTE_UI], agent=agent, serial=serial, timeout=20)
     return cat.stdout if cat.stdout.lstrip().startswith("<") else None
 
 
@@ -78,9 +89,10 @@ def ui_summary(xml_text: str, max_items: int = 60) -> list[dict]:
     return items
 
 
-def current_focus(serial: str | None = None) -> str:
+def current_focus(serial: str | None = None, *, agent=None) -> str:
     """Which activity is actually on screen — the ground truth for 'did the launch land'."""
-    proc = shell.adb_shell(["dumpsys", "window"], serial=serial, timeout=45)
+    from ..device_agent.runtime import exec_on_device
+    proc = exec_on_device(["dumpsys", "window"], agent=agent, serial=serial, timeout=45)
     for line in proc.stdout.splitlines():
         if "mCurrentFocus" in line or "mFocusedApp" in line:
             m = re.search(r"([\w.]+/[\w.$]+)", line)
@@ -89,9 +101,9 @@ def current_focus(serial: str | None = None) -> str:
     return ""
 
 
-def dismiss_system_dialogs(serial: str | None = None) -> None:
+def dismiss_system_dialogs(serial: str | None = None, *, agent=None) -> None:
     """Clear ANR / crash dialogs that would otherwise block every subsequent probe."""
-    shell.adb_shell(["am", "broadcast", "-a", "android.intent.action.CLOSE_SYSTEM_DIALOGS"],
-                    serial=serial, timeout=20)
-    # Keycode 4 = BACK; clears most modal crash dialogs.
-    shell.adb_shell(["input", "keyevent", "4"], serial=serial, timeout=20)
+    from ..device_agent.runtime import exec_on_device
+    exec_on_device(["am", "broadcast", "-a", "android.intent.action.CLOSE_SYSTEM_DIALOGS"],
+                   agent=agent, serial=serial, timeout=20)
+    exec_on_device(["input", "keyevent", "4"], agent=agent, serial=serial, timeout=20)

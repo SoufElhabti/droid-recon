@@ -72,21 +72,27 @@ _SECRET_LITERAL = re.compile(
 )
 
 
-def clear(serial: str | None = None) -> None:
-    from .. import shell
-    shell.adb("logcat", "-c", serial=serial, timeout=30)
+def clear(serial: str | None = None, *, agent=None) -> None:
+    if agent:
+        agent.exec(["logcat", "-c"], timeout=30)
+    else:
+        from .. import shell
+        shell.adb("logcat", "-c", serial=serial, timeout=30)
 
 
-def dump(serial: str | None = None, *, lines: int = 400) -> str:
-    from .. import shell
-    proc = shell.adb("logcat", "-d", "-v", "brief", "-t", str(lines), serial=serial, timeout=60)
+def dump(serial: str | None = None, *, lines: int = 400, agent=None) -> str:
+    if agent:
+        proc = agent.exec(["logcat", "-d", "-v", "brief", "-t", str(lines)], timeout=60)
+    else:
+        from .. import shell
+        proc = shell.adb("logcat", "-d", "-v", "brief", "-t", str(lines), serial=serial, timeout=60)
     return proc.stdout
 
 
 def window(package: str, serial: str | None = None, *, lines: int = 400,
-           max_chars: int = 4000) -> str:
+           max_chars: int = 4000, agent=None) -> str:
     """Dump since the last clear(), keeping lines about `package` or generally notable."""
-    raw = dump(serial, lines=lines)
+    raw = dump(serial, lines=lines, agent=agent)
     kept = [ln.rstrip() for ln in raw.splitlines()
             if package in ln or _INTERESTING.search(ln)]
     text = "\n".join(kept)
@@ -128,6 +134,42 @@ def has_sensitive(text: str, package: str = "") -> list[str]:
 
 def crashed(text: str) -> bool:
     return "FATAL EXCEPTION" in text or "Process crashed" in text
+
+
+def crash_origin(text: str, package: str, component: str | None = None) -> str:
+    """Attribute a fatal stack before treating it as a component failure.
+
+    A freshly started app installs its providers and creates its Application before
+    Android dispatches the requested activity, receiver, or service. A failure in
+    that phase is observable during the probe, but says nothing about the probed
+    component or its Intent handling. The last fatal stack is used because a prior
+    process can finish crashing inside the next probe's logcat window.
+    """
+    if not crashed(text):
+        return "none"
+    fatal = text.rfind("FATAL EXCEPTION")
+    stack = text[fatal:] if fatal >= 0 else text
+    process = re.search(r"\bProcess:\s*([\w.:-]+)", stack)
+    if process and package and not (process.group(1) == package or
+                                    process.group(1).startswith(package + ":")):
+        return "other_process"
+
+    provider = re.search(r"Unable to get provider\s+([\w.$]+)", stack)
+    if provider and provider.group(1) != component:
+        return "app_initialization"
+    if re.search(r"Unable to create application\b", stack):
+        return "app_initialization"
+
+    if component:
+        target_frame = re.search(r"\bat\s+" + re.escape(component)
+                                 + r"\.[\w$<>]+\s*\(", stack)
+        target_launch = ("ComponentInfo{" in stack and
+                         re.search(r"(?:Unable to start|Unable to instantiate)\s+"
+                                   r"(?:activity|receiver|service)\b", stack,
+                                   re.IGNORECASE) and component in stack)
+        if target_frame or target_launch:
+            return "target_component"
+    return "unattributed"
 
 
 def denied(text: str) -> bool:

@@ -10,9 +10,11 @@ Ported from android-privesc-hunt/scripts/pre-analyze.sh:55-180.
 from __future__ import annotations
 
 import hashlib
+import copy
 import re
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from .. import shell
@@ -64,13 +66,28 @@ def _int_attr(el: ET.Element, name: str) -> int | None:
 
 # ---- APK input resolution ----
 
-def resolve_apks(target: str | Path) -> list[Path]:
-    """Accept a single APK, or a directory containing a base + `config.*.apk` split set.
+def resolve_apks(target: str | Path | Sequence[str | Path]) -> list[Path]:
+    """Accept an APK, a split-set directory, or an explicit list of APK paths.
 
-    Returns base-first so `install-multiple` gets a sane order. Raises ValueError with a
-    readable message rather than a traceback — extracted-APK *directories* are a real
-    thing on this machine and must not crash the tool.
+    Returns the likely base first for `install-multiple`; `analyze` verifies the actual
+    base using each manifest's `split` attribute. An explicit list is useful when APKs
+    come from different directories. No file is silently dropped from a supplied list.
     """
+    if isinstance(target, Sequence) and not isinstance(target, (str, bytes, Path)):
+        if not target:
+            raise ValueError("no APK paths supplied")
+        apks: list[Path] = []
+        for item in target:
+            p = Path(item).expanduser()
+            if not p.is_file():
+                raise ValueError(f"not an APK file: {p}")
+            if not zipfile.is_zipfile(p):
+                raise ValueError(f"not a valid APK (not a zip archive): {p}")
+            apks.append(p)
+        if len({p.resolve() for p in apks}) != len(apks):
+            raise ValueError("duplicate APK paths supplied")
+        return _base_first(apks)
+
     p = Path(target).expanduser()
     if not p.exists():
         raise ValueError(f"no such path: {p}")
@@ -87,13 +104,22 @@ def resolve_apks(target: str | Path) -> list[Path]:
                 f"directory contains no valid APK files: {p}\n"
                 f"    (an *extracted* APK directory is not an APK — point at the .apk file)"
             )
-        base = [a for a in apks if not a.name.startswith("config.")]
-        splits = [a for a in apks if a.name.startswith("config.")]
-        # Prefer a file literally named base.apk, else the largest non-config apk.
-        base.sort(key=lambda a: (a.name != "base.apk", -a.stat().st_size))
-        return base + splits
+        invalid = sorted(x for x in p.glob("*.apk") if x not in apks)
+        if invalid:
+            raise ValueError(f"directory contains an invalid APK file: {invalid[0]}")
+        return _base_first(apks)
 
     raise ValueError(f"unsupported path type: {p}")
+
+
+def _base_first(apks: list[Path]) -> list[Path]:
+    """Filename heuristic only; manifest identity is checked in `analyze`."""
+    return sorted(apks, key=lambda a: (
+        a.name != "base.apk",
+        a.name.startswith(("config.", "split_config.", "split_")),
+        -a.stat().st_size,
+        a.name,
+    ))
 
 
 def sha256_of(path: Path) -> str:
@@ -111,23 +137,58 @@ def dump_manifest_xml(apk: Path, timeout: int = 120) -> str:
     apkanalyzer = shell.which("apkanalyzer", "cmdline-tools/latest/bin/apkanalyzer")
     if apkanalyzer:
         proc = shell.run([apkanalyzer, "manifest", "print", str(apk)], timeout=timeout)
-        if proc.ok and proc.stdout.lstrip().startswith("<"):
-            return proc.stdout
-        warn(f"apkanalyzer failed on {apk.name} (rc={proc.rc}), trying aapt2")
+        if proc.ok:
+            try:
+                if ET.fromstring(proc.stdout).tag == "manifest":
+                    return proc.stdout
+            except ET.ParseError:
+                pass
+        warn(f"apkanalyzer did not return a valid manifest for {apk.name} "
+             f"(rc={proc.rc}), trying aapt2")
 
     aapt2 = shell.aapt2_path()
     if aapt2:
         proc = shell.run([aapt2, "dump", "xmltree", "--file", "AndroidManifest.xml", str(apk)],
                          timeout=timeout)
         if proc.ok:
-            return _xmltree_to_xml(proc.stdout)
+            xml = _xmltree_to_xml(proc.stdout)
+            try:
+                if ET.fromstring(xml).tag == "manifest":
+                    return xml
+            except ET.ParseError:
+                pass
 
-    raise ValueError(f"could not decode AndroidManifest.xml from {apk} (no apkanalyzer/aapt2)")
+    raise ValueError(f"could not decode a valid AndroidManifest.xml from {apk} "
+                     "(apkanalyzer/aapt2 unavailable or returned invalid output)")
 
 
 _XMLTREE_EL = re.compile(r"^(\s*)E: ([\w:.-]+)")
-_XMLTREE_AT = re.compile(r'^\s*A: (?:http://schemas.android.com/apk/res/android:)?([\w:.-]+)'
-                         r'(?:\(0x[0-9a-f]+\))?=(?:\(type [^)]+\))?"?([^"\n]*)"?')
+_XMLTREE_AT = re.compile(
+    r'^\s*A: (?:http://schemas.android.com/apk/res/android:)?(?P<name>[\w:.-]+)?'
+    r'(?:\((?P<id>0x[0-9a-fA-F]+)\))?=(?:\(type [^)]+\))?'
+    r'(?:(?:"(?P<quoted>(?:\\.|[^"\\])*)")|(?P<bare>\S+))'
+)
+
+# Recent SDK tools sometimes omit framework attribute names in decoded manifests.
+# These public Android resource IDs cover every attribute consumed by parse_manifest.
+# Resource IDs are stable across Android releases; unknown IDs are ignored rather
+# than emitted as malformed/fictional XML attributes.
+_ANDROID_ATTR_IDS = {
+    "0x01010003": "name", "0x01010006": "permission",
+    "0x01010007": "readPermission", "0x01010008": "writePermission",
+    "0x01010009": "protectionLevel", "0x0101000b": "sharedUserId",
+    "0x0101000e": "enabled", "0x0101000f": "debuggable",
+    "0x01010010": "exported", "0x01010018": "authorities",
+    "0x0101001b": "grantUriPermissions", "0x01010026": "mimeType",
+    "0x01010027": "scheme", "0x01010028": "host",
+    "0x01010029": "port", "0x0101002a": "path",
+    "0x0101002b": "pathPrefix", "0x0101002c": "pathPattern",
+    "0x01010202": "targetActivity", "0x0101020c": "minSdkVersion",
+    "0x0101021b": "versionCode", "0x0101021c": "versionName",
+    "0x01010270": "targetSdkVersion", "0x01010280": "allowBackup",
+    "0x010104ec": "usesCleartextTraffic",
+    "0x01010527": "networkSecurityConfig",
+}
 
 
 def _xmltree_to_xml(dump: str) -> str:
@@ -157,8 +218,17 @@ def _xmltree_to_xml(dump: str) -> str:
             continue
         a = _XMLTREE_AT.match(line)
         if a and pending is not None:
-            name, val = a.group(1), a.group(2).strip()
-            prefix = "" if ":" in name else "android:"
+            name = a.group("name") or _ANDROID_ATTR_IDS.get((a.group("id") or "").lower())
+            if not name:
+                continue
+            val = (a.group("quoted") if a.group("quoted") is not None
+                   else a.group("bare")).strip()
+            # `package` and `split` are unnamespaced manifest-root attributes.
+            # Namespacing them hides the package and split identity from the parser.
+            root_attr = stack and stack[-1][1] == "manifest" and name in {
+                "package", "split", "platformBuildVersionCode", "platformBuildVersionName",
+            }
+            prefix = "" if ":" in name or root_attr else "android:"
             val = val.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
             pending.append(f' {prefix}{name}="{val}"')
     if pending is not None:
@@ -203,6 +273,14 @@ def _protection_of(name: str | None, declared: dict[str, str]) -> str | None:
     return None
 
 
+def _qualified_component_name(name: str, package: str) -> str:
+    if name.startswith("."):
+        return package + name
+    if "." not in name:
+        return f"{package}.{name}"
+    return name
+
+
 # Coarse platform permission table: only the distinction "any app can hold it" vs not.
 _PLATFORM_PROTECTION: dict[str, str] = {
     "android.permission.INTERNET": "normal",
@@ -229,7 +307,7 @@ _PLATFORM_PROTECTION: dict[str, str] = {
 def _component_issues(c: Component, surface_pkg: str) -> list[str]:
     """Manifest-level red flags. Ported from pre-analyze.sh component issue rules."""
     issues: list[str] = []
-    if not c.exported:
+    if not c.exported or not c.enabled:
         return issues
 
     if c.type == "provider":
@@ -273,7 +351,8 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
     surface.target_sdk = surface.target_sdk or _int_attr(root, "targetSdkVersion")
 
     surface.uses_permissions = sorted(
-        {n for u in root.findall("uses-permission") if (n := _attr(u, "name"))}
+        {n for tag in ("uses-permission", "uses-permission-sdk-23")
+         for u in root.findall(tag) if (n := _attr(u, "name"))}
     )
 
     declared: dict[str, str] = {}
@@ -301,6 +380,7 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
         return surface
 
     surface.debuggable = bool(_bool_attr(app, "debuggable", False))
+    app_enabled = bool(_bool_attr(app, "enabled", True))
     surface.allow_backup = bool(_bool_attr(app, "allowBackup", True))
     surface.uses_cleartext_traffic = _bool_attr(app, "usesCleartextTraffic", None)
     surface.network_security_config = _attr(app, "networkSecurityConfig")
@@ -321,10 +401,7 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
             name = _attr(el, "name")
             if not name:
                 continue
-            if name.startswith("."):
-                name = pkg + name
-            elif "." not in name:
-                name = f"{pkg}.{name}"
+            name = _qualified_component_name(name, pkg)
 
             filters = _parse_intent_filters(el)
             explicit = _bool_attr(el, "exported", None)
@@ -341,7 +418,7 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
             else:
                 inferred, source = explicit, "explicit"
 
-            perm = _attr(el, "permission")
+            perm = _attr(el, "permission") or _attr(app, "permission")
             read_perm = _attr(el, "readPermission")
             write_perm = _attr(el, "writePermission")
 
@@ -355,19 +432,43 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
                 write_permission=write_perm,
                 authorities=[a for a in (_attr(el, "authorities") or "").split(";") if a],
                 grant_uri_permissions=bool(_bool_attr(el, "grantUriPermissions", False)),
-                enabled=bool(_bool_attr(el, "enabled", True)),
+                enabled=app_enabled and bool(_bool_attr(el, "enabled", True)),
                 intent_filters=filters,
-                target_activity=_attr(el, "targetActivity"),
+                target_activity=(_qualified_component_name(_attr(el, "targetActivity"), pkg)
+                                 if _attr(el, "targetActivity") else None),
             )
 
-            # For providers, the effective read guard is readPermission or permission.
-            guard = read_perm or perm if ctype == "provider" else perm
-            comp.reachable_from = classify_reach(
-                exported=comp.exported,
-                permission=guard,
-                permission_protection=_protection_of(guard, declared),
-                browsable=comp.browsable,
-            )
+            if ctype == "provider":
+                # A provider has separate read and write gates. Path-specific guards
+                # and temporary URI grants can change reach for individual URIs, so
+                # these are conservative provider-wide candidates, not proof of access.
+                read_guard = read_perm or perm
+                write_guard = write_perm or perm
+                comp.read_reachable_from = classify_reach(
+                    exported=comp.exported, enabled=comp.enabled,
+                    permission=read_guard,
+                    permission_protection=_protection_of(read_guard, declared),
+                )
+                comp.write_reachable_from = classify_reach(
+                    exported=comp.exported, enabled=comp.enabled,
+                    permission=write_guard,
+                    permission_protection=_protection_of(write_guard, declared),
+                )
+                # ContentProvider.call() has no framework read/write permission
+                # check; its method must enforce access itself. Treat an exported
+                # provider as a candidate until an ordinary-app test verifies it.
+                comp.call_reachable_from = classify_reach(
+                    exported=comp.exported, enabled=comp.enabled,
+                    permission=None, permission_protection=None,
+                )
+                comp.reachable_from = comp.read_reachable_from
+            else:
+                comp.reachable_from = classify_reach(
+                    exported=comp.exported, enabled=comp.enabled,
+                    permission=perm,
+                    permission_protection=_protection_of(perm, declared),
+                    browsable=comp.browsable,
+                )
             comp.issues = _component_issues(comp, pkg)
             surface.components.append(comp)
 
@@ -400,14 +501,134 @@ def _decode_protection_flags(raw: str) -> str:
     return "|".join([base, *extras])
 
 
-def analyze(target: str | Path) -> AttackSurface:
-    """Full static manifest pass over an APK path or split-set directory."""
-    apks = resolve_apks(target)
+def _manifest_roots(apks: list[Path]) -> list[tuple[Path, ET.Element, str | None]]:
+    roots: list[tuple[Path, ET.Element, str | None]] = []
+    for apk in apks:
+        try:
+            root = ET.fromstring(dump_manifest_xml(apk))
+        except ET.ParseError as exc:
+            raise ValueError(f"invalid decoded manifest in {apk}: {exc}") from exc
+        if root.tag != "manifest":
+            raise ValueError(f"decoded manifest in {apk} has unexpected root {root.tag!r}")
+        split = root.attrib.get("split") or _attr(root, "split") or None
+        roots.append((apk, root, split))
+    return roots
+
+
+def _merged_manifest(
+    roots: list[tuple[Path, ET.Element, str | None]],
+) -> tuple[str, list[Path], dict[tuple[str, str], tuple[str, str | None]]]:
+    """Combine base and feature declarations while retaining component provenance.
+
+    Split manifests are *additive*: app-wide flags and SDK defaults come from the base,
+    while declarations of permissions and components may arrive in any split. Parsing
+    the combined XML once makes permission reachability consistent across splits.
+    """
+    bases = [entry for entry in roots if not entry[2]]
+    if len(bases) != 1:
+        raise ValueError(
+            f"expected exactly one base APK manifest (without a split name), found {len(bases)}"
+        )
+    base_path, base_root, _ = bases[0]
+    package = base_root.attrib.get("package", "")
+    if not package:
+        raise ValueError(f"base manifest has no package: {base_path}")
+    ordered = [bases[0], *(entry for entry in roots if entry[2])]
+    base_version = _int_attr(base_root, "versionCode")
+    seen_splits: set[str] = set()
+    origins: dict[tuple[str, str], tuple[str, str | None]] = {}
+    merged = copy.deepcopy(base_root)
+    merged_app = merged.find("application")
+
+    # Names are unique within the installed package. A duplicate declaration makes
+    # our effective exposure ambiguous, so fail instead of reporting either one.
+    for apk, root, split in ordered:
+        if root.attrib.get("package") != package:
+            raise ValueError(
+                f"APK package mismatch: {apk} declares {root.attrib.get('package')!r}; "
+                f"base declares {package!r}"
+            )
+        version = _int_attr(root, "versionCode")
+        if apk != base_path and version is not None and base_version is not None \
+                and version != base_version:
+            raise ValueError(
+                f"APK versionCode mismatch: {apk} declares {version}; "
+                f"base declares {base_version}"
+            )
+        if split:
+            if split in seen_splits:
+                raise ValueError(f"duplicate split name {split!r} in APK set")
+            seen_splits.add(split)
+
+        app = root.find("application")
+        if app is None:
+            continue
+        for tag in _COMPONENT_TAGS:
+            for component in app.findall(tag):
+                raw_name = _attr(component, "name")
+                if not raw_name:
+                    continue
+                name = _qualified_component_name(raw_name, package)
+                key = (tag, name)
+                if key in origins:
+                    prev_apk, _ = origins[key]
+                    raise ValueError(
+                        f"duplicate {tag} {name} declared in {prev_apk} and {apk}"
+                    )
+                origins[key] = (str(apk), split)
+                if apk == base_path:
+                    continue
+                if merged_app is None:
+                    merged_app = ET.SubElement(merged, "application")
+                added = copy.deepcopy(component)
+                # A split's application permission is the default for its own
+                # components if explicitly supplied there.
+                split_permission = _attr(app, "permission")
+                if split_permission and not _attr(added, "permission"):
+                    added.set(ANDROID_NS + "permission", split_permission)
+                merged_app.append(added)
+
+    permission_defs: dict[str, str] = {
+        _attr(el, "name"): _attr(el, "protectionLevel") or "normal"
+        for el in merged.findall("permission") if _attr(el, "name")
+    }
+    for apk, root, split in ordered[1:]:
+        for tag in ("uses-permission", "uses-permission-sdk-23"):
+            for el in root.findall(tag):
+                merged.append(copy.deepcopy(el))
+        for el in root.findall("permission"):
+            name = _attr(el, "name")
+            if not name:
+                continue
+            level = _attr(el, "protectionLevel") or "normal"
+            previous = permission_defs.get(name)
+            if previous is not None:
+                def normalized(value: str) -> str:
+                    return _decode_protection_flags(value) if value.startswith("0x") or value.isdigit() else value.lower()
+                if normalized(previous) != normalized(level):
+                    raise ValueError(
+                        f"conflicting protectionLevel for {name} in {apk}: "
+                        f"{previous!r} vs {level!r}"
+                    )
+                continue
+            permission_defs[name] = level
+            merged.append(copy.deepcopy(el))
+
+    paths = [entry[0] for entry in ordered]
+    return ET.tostring(merged, encoding="unicode"), paths, origins
+
+
+def analyze(target: str | Path | Sequence[str | Path]) -> AttackSurface:
+    """Analyze every manifest in a base APK and its supplied split APKs."""
+    roots = _manifest_roots(resolve_apks(target))
+    xml_text, apks, origins = _merged_manifest(roots)
     base = apks[0]
     say("static", f"manifest <- {base.name}" + (f" (+{len(apks) - 1} splits)" if len(apks) > 1 else ""))
-    xml_text = dump_manifest_xml(base)
     surface = parse_manifest(xml_text, apk_paths=apks)
-    surface.apk_sha256 = sha256_of(base)
+    surface.apk_sha256s = {str(apk): sha256_of(apk) for apk in apks}
+    surface.apk_sha256 = surface.apk_sha256s[str(base)]
+    for component in surface.components:
+        component.source_apk, component.source_split = origins[(component.type, component.name)]
     surface.native_libs = _native_libs(apks)
     return surface
 

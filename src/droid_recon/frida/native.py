@@ -147,23 +147,28 @@ def _render(template: str, duration: int, modules: list[str] | None = None) -> s
     return js
 
 
-def list_native_libs(package: str, serial: str | None = None) -> list[str]:
+def list_native_libs(package: str, serial: str | None = None,
+                     *, agent=None) -> list[str]:
     """.so files the app actually shipped (from its install dir)."""
-    res = shell.adb_script(
+    from ..device_agent.runtime import exec_script as _exec_script
+    res = _exec_script(
         f"find /data/app -path '*{package}*' -name '*.so' 2>/dev/null | head -50",
-        serial=serial, timeout=60,
+        agent=agent, serial=serial, timeout=60,
     )
     return sorted({Path(p.strip()).name for p in res.stdout.splitlines() if p.strip()})
 
 
-def loaded_modules(package: str, serial: str | None = None) -> list[str]:
+def loaded_modules(package: str, serial: str | None = None,
+                   *, agent=None) -> list[str]:
     """.so files currently mapped into the running process — the ones worth hooking."""
-    pid = shell.adb_shell(["pidof", package], serial=serial, timeout=20).stdout.strip().split()
+    from ..device_agent.runtime import exec_on_device, exec_script as _exec_script
+    pid = exec_on_device(["pidof", package], agent=agent, serial=serial,
+                         timeout=20).stdout.strip().split()
     if not pid:
         return []
-    res = shell.adb_script(
+    res = _exec_script(
         f"cat /proc/{pid[0]}/maps 2>/dev/null | grep -o '/[^ ]*\\.so' | sort -u",
-        serial=serial, timeout=45,
+        agent=agent, serial=serial, timeout=45,
     )
     names = {Path(p.strip()).name for p in res.stdout.splitlines() if p.strip()}
     # Drop the platform's own libraries; the app's code is what matters.
@@ -174,7 +179,8 @@ def loaded_modules(package: str, serial: str | None = None) -> list[str]:
 
 def trace(package: str, mode: str = "jni", *, serial: str | None = None,
           modules: list[str] | None = None, duration: int = 25,
-          spawn: bool = True, out_dir: Path | None = None) -> tuple[bool, dict]:
+          spawn: bool = True, out_dir: Path | None = None,
+          transport=None, agent=None) -> tuple[bool, dict]:
     """Run a native trace. Returns (ok, result-dict).
 
     `jni` is the right default: it is cheap, it works on a spawn (so it catches
@@ -183,7 +189,7 @@ def trace(package: str, mode: str = "jni", *, serial: str | None = None,
     """
     from . import server as frida_server
 
-    available, msg = frida_server.ensure_server(serial)
+    available, msg = frida_server.ensure_server(serial, transport=transport)
     if not available:
         return False, {"error": msg, "mode": mode}
 
@@ -192,7 +198,7 @@ def trace(package: str, mode: str = "jni", *, serial: str | None = None,
     elif mode == "libc":
         js = _render(_LIBC_TRACE, duration)
     elif mode == "exports":
-        mods = modules or loaded_modules(package, serial)
+        mods = modules or loaded_modules(package, serial, agent=agent)
         if not mods:
             return False, {"error": "no app-specific .so modules loaded — "
                                     "run with the app started, or pass --module",
@@ -204,11 +210,12 @@ def trace(package: str, mode: str = "jni", *, serial: str | None = None,
     work = out_dir or Path("/tmp")
     work.mkdir(parents=True, exist_ok=True)
     script_path = work / f"native_{mode}.js"
-    script_path.write_text(js)
+    script_path.write_text(js, encoding="utf-8")
 
     say("native", f"{mode} trace on {package} ({duration}s)")
     good, output = frida_server.run_script(package, script_path, serial,
-                                           spawn=spawn, duration=duration)
+                                           spawn=spawn, duration=duration,
+                                           transport=transport)
     if not good:
         return False, {"error": output[:600], "mode": mode}
 

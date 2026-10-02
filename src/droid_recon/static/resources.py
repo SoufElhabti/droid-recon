@@ -9,6 +9,7 @@ the resource tree (apktool) rather than just the decoded manifest.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -55,7 +56,7 @@ def extract_resources(apk: Path, dest: Path, *, force: bool = False) -> Path | N
     if not dest.is_dir():
         warn(f"apktool failed (rc={proc.rc}) — skipping resource analysis")
         return None
-    marker.write_text(str(apk))
+    marker.write_text(str(apk), encoding="utf-8")
     return dest
 
 
@@ -108,7 +109,7 @@ def find_network_security_config(res_root: Path) -> dict | None:
         if root.tag != "network-security-config":
             continue
         issues = []
-        text = xml_file.read_text(errors="ignore")
+        text = xml_file.read_text(encoding="utf-8", errors="ignore")
         if 'cleartextTrafficPermitted="true"' in text:
             issues.append("cleartextTrafficPermitted=true — plaintext HTTP allowed")
         if 'src="user"' in text:
@@ -117,3 +118,29 @@ def find_network_security_config(res_root: Path) -> dict | None:
             issues.append("<debug-overrides> present")
         return {"file": str(xml_file.relative_to(res_root)), "issues": issues}
     return None
+
+
+def analyze_all(apks: list[Path], cache_root: Path, *, force: bool = False) -> dict:
+    """Decode every split and retain the APK provenance of resource findings."""
+    paths: list[dict] = []
+    network_configs: list[dict] = []
+    status: list[dict] = []
+    for apk in apks:
+        hasher = hashlib.sha256()
+        with apk.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                hasher.update(block)
+        digest = hasher.hexdigest()[:16]
+        root = extract_resources(apk, cache_root / digest, force=force)
+        if root is None:
+            status.append({"apk": str(apk), "status": "unsupported",
+                           "reason": "apktool unavailable or resource decode failed"})
+            continue
+        status.append({"apk": str(apk), "status": "tested"})
+        for entry in find_fileprovider_paths(root):
+            paths.append({**entry, "source_apk": str(apk)})
+        network = find_network_security_config(root)
+        if network:
+            network_configs.append({**network, "source_apk": str(apk)})
+    return {"fileprovider_paths": paths, "network_configs": network_configs,
+            "status": status}

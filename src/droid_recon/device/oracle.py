@@ -48,12 +48,15 @@ class Snapshot:
         }
 
 
-def snapshot(package: str, serial: str | None = None, *, with_ui: bool = True) -> Snapshot:
+def snapshot(package: str, serial: str | None = None, *, with_ui: bool = True,
+             agent=None) -> Snapshot:
+    from ..device_agent.runtime import exec_on_device
     snap = Snapshot()
-    snap.focus = screen.current_focus(serial)
-    snap.pid = shell.adb_shell(["pidof", package], serial=serial, timeout=20).stdout.strip()
+    snap.focus = screen.current_focus(serial, agent=agent)
+    snap.pid = exec_on_device(["pidof", package], agent=agent, serial=serial,
+                              timeout=20).stdout.strip()
     if with_ui:
-        xml = screen.ui_tree_xml(serial)
+        xml = screen.ui_tree_xml(serial, agent=agent)
         if xml:
             items = screen.ui_summary(xml, max_items=120)
             snap.ui_texts = [i["text"] or i["desc"] or i["resource_id"] for i in items if
@@ -149,7 +152,18 @@ def evaluate(
         signals.append("instrumentation_crash")
         evidence["instrumentation_crash"] = _first_stack(log_text, 4)
         crashed = False
+    elif crashed and target_component:
+        origin = logcat.crash_origin(log_text, package, target_component)
+        if origin != "target_component":
+            signals.append("startup_crash" if origin == "app_initialization"
+                           else "unattributed_crash")
+            evidence["crash_origin"] = origin
+            evidence["crash_excerpt"] = _first_stack(log_text)
+            crashed = False
     elif crashed:
+        signals.append("crash")
+        evidence["crash_excerpt"] = _first_stack(log_text)
+    if crashed and "crash" not in signals:
         signals.append("crash")
         evidence["crash_excerpt"] = _first_stack(log_text)
     pid_died = bool(before.pid) and not after.pid

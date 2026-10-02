@@ -79,7 +79,7 @@ def boot(avd: str, *, headless: bool = True, log_path: Path | None = None,
         argv.append("-wipe-data")
 
     say("device", f"booting AVD '{avd}' ({'headless' if headless else 'windowed'})")
-    out = open(log_path, "w") if log_path else subprocess.DEVNULL
+    out = open(log_path, "w", encoding="utf-8") if log_path else subprocess.DEVNULL
     subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT,
                      start_new_session=True, env=os.environ.copy())
 

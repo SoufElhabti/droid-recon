@@ -30,19 +30,23 @@ def data_dir(package: str) -> str:
     return f"/data/data/{package}"
 
 
-def _ls(path: str, serial: str | None = None) -> list[str]:
-    proc = shell.adb_shell(["ls", "-la", path], serial=serial, timeout=45)
+def _ls(path: str, serial: str | None = None, *, agent=None) -> list[str]:
+    from ..device_agent.runtime import exec_on_device
+    proc = exec_on_device(["ls", "-la", path], agent=agent, serial=serial, timeout=45)
     if not proc.ok:
         return []
     return [ln for ln in proc.stdout.splitlines() if ln.strip()]
 
 
-def pull_private_data(package: str, dest: Path, serial: str | None = None) -> dict:
+def pull_private_data(package: str, dest: Path, serial: str | None = None,
+                      *, agent=None) -> dict:
     """Copy shared_prefs/ databases/ files/ off the device. Needs root."""
+    from ..device_agent.runtime import exec_on_device
+
     dest.mkdir(parents=True, exist_ok=True)
     result: dict = {"pulled": [], "errors": [], "root_required": True}
 
-    who = shell.adb_shell(["whoami"], serial=serial, timeout=15).stdout.strip()
+    who = exec_on_device(["whoami"], agent=agent, serial=serial, timeout=15).stdout.strip()
     if who != "root":
         result["errors"].append("not root — cannot read /data/data; run `adb root` first")
         return result
@@ -50,20 +54,21 @@ def pull_private_data(package: str, dest: Path, serial: str | None = None) -> di
     base = data_dir(package)
     for sub in ("shared_prefs", "databases", "files", "no_backup"):
         remote = f"{base}/{sub}"
-        exists = shell.adb_shell(["test", "-d", remote], serial=serial, timeout=20)
+        exists = exec_on_device(["test", "-d", remote], agent=agent, serial=serial, timeout=20)
         if exists.rc != 0:
             continue
-        # Stage through /data/local/tmp: `adb pull` from /data/data can hit
-        # permission errors even as root, depending on SELinux context.
         staging = f"/data/local/tmp/dr_{sub}"
-        shell.adb_shell(["rm", "-rf", staging], serial=serial, timeout=30)
-        cp = shell.adb_shell(["cp", "-r", remote, staging], serial=serial, timeout=120)
+        exec_on_device(["rm", "-rf", staging], agent=agent, serial=serial, timeout=30)
+        cp = exec_on_device(["cp", "-r", remote, staging],
+                            agent=agent, serial=serial, timeout=120)
         if cp.rc != 0:
             result["errors"].append(f"{sub}: {cp.stderr.strip()[:160]}")
             continue
-        shell.adb_shell(["chmod", "-R", "777", staging], serial=serial, timeout=60)
+        exec_on_device(["chmod", "-R", "777", staging],
+                       agent=agent, serial=serial, timeout=60)
+        # File transfer still goes through ADB — the agent has no recursive pull.
         pull = shell.adb("pull", staging, str(dest / sub), serial=serial, timeout=300)
-        shell.adb_shell(["rm", "-rf", staging], serial=serial, timeout=30)
+        exec_on_device(["rm", "-rf", staging], agent=agent, serial=serial, timeout=30)
         if (dest / sub).exists():
             result["pulled"].append(sub)
         else:
@@ -80,7 +85,7 @@ def scan_prefs_for_secrets(dest: Path) -> list[dict]:
         return out
     for xml_file in sorted(prefs.rglob("*.xml")):
         try:
-            text = xml_file.read_text(errors="ignore")
+            text = xml_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         for line in text.splitlines():
@@ -103,28 +108,32 @@ def list_databases(dest: Path) -> list[dict]:
     return out
 
 
-def dump_db_tables(package: str, db_remote_path: str, serial: str | None = None) -> list[str]:
+def dump_db_tables(package: str, db_remote_path: str, serial: str | None = None,
+                   *, agent=None) -> list[str]:
     """List tables via the device's own sqlite3, avoiding a local sqlite dependency."""
-    proc = shell.adb_shell(
-        ["sqlite3", db_remote_path, ".tables"], serial=serial, timeout=60
+    from ..device_agent.runtime import exec_on_device
+    proc = exec_on_device(
+        ["sqlite3", db_remote_path, ".tables"], agent=agent, serial=serial, timeout=60
     )
     if not proc.ok:
         return []
     return sorted({t for t in proc.stdout.split() if t})
 
 
-def world_readable_scan(package: str, serial: str | None = None) -> list[dict]:
+def world_readable_scan(package: str, serial: str | None = None,
+                        *, agent=None) -> list[dict]:
     """Files any unprivileged app can read: bad modes in the sandbox, or shared storage.
 
     This is the part that holds on a stock, non-rooted device — unlike everything else
     in this module, which needs root to observe.
     """
+    from ..device_agent.runtime import exec_on_device
+
     findings: list[dict] = []
 
-    # Permissive modes inside the private data dir.
-    proc = shell.adb_shell(
+    proc = exec_on_device(
         ["find", data_dir(package), "-type", "f", "-perm", "-o+r"],
-        serial=serial, timeout=120,
+        agent=agent, serial=serial, timeout=120,
     )
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -135,9 +144,8 @@ def world_readable_scan(package: str, serial: str | None = None) -> list[dict]:
                 "reachable_from": "third_party_app",
             })
 
-    # Shared external storage: readable by anything holding READ_EXTERNAL_STORAGE.
     for ext in (f"/sdcard/Android/data/{package}", "/sdcard/Download"):
-        proc = shell.adb_shell(["ls", "-la", ext], serial=serial, timeout=60)
+        proc = exec_on_device(["ls", "-la", ext], agent=agent, serial=serial, timeout=60)
         if proc.ok and proc.stdout.strip():
             files = [ln for ln in proc.stdout.splitlines()[1:] if ln.strip()]
             if files:

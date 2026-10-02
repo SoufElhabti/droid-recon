@@ -95,10 +95,11 @@ def sweep(tree: Path, surface: AttackSurface, *, context_chars: int = 60,
     label_counts: dict[str, int] = {}
 
     for java in tree.rglob("*.java"):
-        rel = str(java.relative_to(tree))
+        # jadx paths in reports use '/' on every host so component hints match on Windows.
+        rel = java.relative_to(tree).as_posix()
         is_lib = P.is_library_path(rel)
         try:
-            content = java.read_text(errors="ignore")
+            content = java.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         report.files_scanned += 1
@@ -166,6 +167,10 @@ def verdict(surface: AttackSurface, report: CodeReport | None = None) -> str:
         signals.append("SEND target")
     if s["has_grant_uri"]:
         signals.append("grantUriPermissions")
+    if s["providers_write_reachable"]:
+        signals.append(f"{s['providers_write_reachable']} writable provider(s)")
+    if s["providers_call_reachable"]:
+        signals.append(f"{s['providers_call_reachable']} callable provider(s)")
     if s["permission_misconfigs"]:
         signals.append(f"{s['permission_misconfigs']} perm misconfigs")
     if s["debuggable"]:

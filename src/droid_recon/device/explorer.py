@@ -54,7 +54,7 @@ class Credentials:
         if path:
             p = Path(path).expanduser()
             if p.exists():
-                d = json.loads(p.read_text())
+                d = json.loads(p.read_text(encoding="utf-8"))
                 return cls(d.get("username", ""), d.get("password", ""),
                            {k: v for k, v in d.items() if k not in ("username", "password")})
             warn(f"credentials file not found: {p}")
@@ -105,17 +105,18 @@ def _signature(activity: str, items: list[dict]) -> str:
 
 
 def _capture_state(serial: str | None, depth: int = 0, reached_by: str = "",
-                   shots: Path | None = None) -> ScreenState | None:
-    xml = screen.ui_tree_xml(serial)
+                   shots: Path | None = None, *, agent=None) -> ScreenState | None:
+    xml = screen.ui_tree_xml(serial, agent=agent)
     if not xml:
         return None
     items = screen.ui_summary(xml, max_items=150)
-    activity = screen.current_focus(serial)
+    activity = screen.current_focus(serial, agent=agent)
     texts = [i["text"] or i["desc"] for i in items if (i["text"] or i["desc"])]
     clickables = [i for i in items if i.get("clickable")]
     shot = None
     if shots is not None:
-        p = screen.capture(shots, f"d{depth}_{activity.split('/')[-1][:30]}", serial)
+        p = screen.capture(shots, f"d{depth}_{activity.split('/')[-1][:30]}", serial,
+                           agent=agent)
         shot = str(p) if p else None
     return ScreenState(_signature(activity, items), activity, texts, clickables, shot,
                        depth, reached_by)
@@ -129,11 +130,13 @@ def _bounds_center(bounds: str) -> tuple[int, int] | None:
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
-def _tap(serial: str | None, bounds: str) -> bool:
+def _tap(serial: str | None, bounds: str, *, agent=None) -> bool:
+    from ..device_agent.runtime import exec_on_device
     c = _bounds_center(bounds)
     if not c:
         return False
-    shell.adb_shell(["input", "tap", str(c[0]), str(c[1])], serial=serial, timeout=25)
+    exec_on_device(["input", "tap", str(c[0]), str(c[1])],
+                   agent=agent, serial=serial, timeout=25)
     return True
 
 
@@ -144,14 +147,17 @@ def _label(item: dict) -> str:
 # ---- authentication ----
 
 def authenticate(package: str, creds: Credentials, serial: str | None = None,
-                 shots: Path | None = None, max_attempts: int = 3) -> dict:
+                 shots: Path | None = None, max_attempts: int = 3,
+                 *, agent=None) -> dict:
     """Find the login form, fill it, submit, and verify we actually got in."""
+    from ..device_agent.runtime import exec_on_device
+
     if not creds.present:
         return {"attempted": False, "reason": "no credentials supplied "
                                               "(--credentials or DROID_RECON_USER/PASS)"}
 
     say("auth", f"attempting login as {creds.username[:3]}***")
-    before = _capture_state(serial, 0, "pre-auth", shots)
+    before = _capture_state(serial, 0, "pre-auth", shots, agent=agent)
     if before is None:
         return {"attempted": False, "reason": "could not read the UI tree"}
 
@@ -159,29 +165,33 @@ def authenticate(package: str, creds: Credentials, serial: str | None = None,
         return {"attempted": False, "reason": "no login form detected on the current screen",
                 "activity": before.activity, "ui_sample": before.texts[:10]}
 
-    xml = screen.ui_tree_xml(serial)
+    xml = screen.ui_tree_xml(serial, agent=agent)
     fields = _find_fields(xml or "")
     if not fields.get("password"):
         return {"attempted": False, "reason": "no password field found",
                 "fields_seen": sorted(fields)}
 
     if fields.get("username"):
-        _tap(serial, fields["username"])
+        _tap(serial, fields["username"], agent=agent)
         time.sleep(0.4)
-        shell.adb_shell(["input", "text", _escape(creds.username)], serial=serial, timeout=25)
-    _tap(serial, fields["password"])
+        exec_on_device(["input", "text", _escape(creds.username)],
+                       agent=agent, serial=serial, timeout=25)
+    _tap(serial, fields["password"], agent=agent)
     time.sleep(0.4)
-    shell.adb_shell(["input", "text", _escape(creds.password)], serial=serial, timeout=25)
-    shell.adb_shell(["input", "keyevent", "111"], serial=serial, timeout=20)  # ESC: hide IME
+    exec_on_device(["input", "text", _escape(creds.password)],
+                   agent=agent, serial=serial, timeout=25)
+    exec_on_device(["input", "keyevent", "111"],
+                   agent=agent, serial=serial, timeout=20)  # ESC: hide IME
 
     submitted = False
     if fields.get("submit"):
-        submitted = _tap(serial, fields["submit"])
+        submitted = _tap(serial, fields["submit"], agent=agent)
     if not submitted:
-        shell.adb_shell(["input", "keyevent", "66"], serial=serial, timeout=20)  # ENTER
+        exec_on_device(["input", "keyevent", "66"],
+                       agent=agent, serial=serial, timeout=20)  # ENTER
 
     time.sleep(4.0)
-    after = _capture_state(serial, 0, "post-auth", shots)
+    after = _capture_state(serial, 0, "post-auth", shots, agent=agent)
     if after is None:
         return {"attempted": True, "authenticated": False, "reason": "UI unreadable after submit"}
 
@@ -275,7 +285,7 @@ def _find_fields(xml: str) -> dict[str, str]:
 
 def explore(package: str, serial: str | None = None, *, max_screens: int = 25,
             max_depth: int = 4, shots: Path | None = None,
-            creds: Credentials | None = None) -> dict:
+            creds: Credentials | None = None, agent=None) -> dict:
     """Bounded BFS over the app's screens. Returns a screen graph.
 
     Deliberately avoids destructive controls (logout, delete, purchase) — an autonomous
@@ -286,7 +296,7 @@ def explore(package: str, serial: str | None = None, *, max_screens: int = 25,
     edges: list[dict] = []
     avoided: list[str] = []
 
-    start = _capture_state(serial, 0, "entry", shots)
+    start = _capture_state(serial, 0, "entry", shots, agent=agent)
     if start is None:
         return {"error": "could not read the UI tree — is the app in the foreground?"}
     visited[start.sig] = start
@@ -309,18 +319,17 @@ def explore(package: str, serial: str | None = None, *, max_screens: int = 25,
                 avoided.append(label)
                 continue
 
-            if not _tap(serial, item.get("bounds", "")):
+            if not _tap(serial, item.get("bounds", ""), agent=agent):
                 continue
             time.sleep(SETTLE)
 
-            new = _capture_state(serial, depth + 1, label, shots)
+            new = _capture_state(serial, depth + 1, label, shots, agent=agent)
             if new is None:
-                _back(serial)
+                _back(serial, agent=agent)
                 continue
 
-            # Left the app entirely — go back and keep the crawl inside the target.
             if package not in (new.activity or "") and new.activity:
-                _back(serial)
+                _back(serial, agent=agent)
                 time.sleep(SETTLE)
                 continue
 
@@ -329,7 +338,7 @@ def explore(package: str, serial: str | None = None, *, max_screens: int = 25,
                 visited[new.sig] = new
                 queue.append((new, depth + 1))
 
-            _back(serial)
+            _back(serial, agent=agent)
             time.sleep(SETTLE)
 
     ok(f"explored {len(visited)} screens, {len(edges)} transitions")
@@ -351,5 +360,6 @@ def _redact_state(s: ScreenState, creds: Credentials) -> dict:
     return d
 
 
-def _back(serial: str | None) -> None:
-    shell.adb_shell(["input", "keyevent", "4"], serial=serial, timeout=20)
+def _back(serial: str | None, *, agent=None) -> None:
+    from ..device_agent.runtime import exec_on_device
+    exec_on_device(["input", "keyevent", "4"], agent=agent, serial=serial, timeout=20)

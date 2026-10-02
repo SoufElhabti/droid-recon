@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .. import shell
 from ..log import ok, say, warn
+from ..transport import FridaTransportConfig
 
 REMOTE_PATH = "/data/local/tmp/frida-server"
 CACHE = Path.home() / ".cache" / "droid-recon" / "frida"
@@ -74,13 +75,23 @@ def is_running(serial: str | None = None) -> bool:
     return bool(proc.stdout.strip())
 
 
-def ensure_server(serial: str | None = None) -> tuple[bool, str]:
+def _forward_port(port: int, serial: str | None = None) -> bool:
+    """Set up adb port forwarding for Frida TCP. Idempotent."""
+    proc = shell.adb("forward", f"tcp:{port}", f"tcp:{port}", serial=serial, timeout=20)
+    return proc.ok
+
+
+def ensure_server(serial: str | None = None,
+                  transport: FridaTransportConfig | None = None) -> tuple[bool, str]:
     """Push and start frida-server if needed. Returns (available, message)."""
+    transport = transport or FridaTransportConfig()
     version = host_version()
     if not version:
         return False, "frida CLI not found on PATH (pip install frida-tools)"
 
     if is_running(serial):
+        if transport.mode in ("tcp", "auto"):
+            _forward_port(transport.port, serial)
         ok(f"frida-server already running (host frida {version})")
         return True, f"already running, host {version}"
 
@@ -97,17 +108,19 @@ def ensure_server(serial: str | None = None) -> tuple[bool, str]:
         return False, f"push failed: {push.stderr.strip()[:160]}"
     shell.adb_shell(["chmod", "755", REMOTE_PATH], serial=serial, timeout=20)
 
-    # Detach so the shell returns; frida-server must outlive this command.
-    shell.adb_shell(
-        ["nohup", REMOTE_PATH, "-D", ">/dev/null", "2>&1", "&"], serial=serial, timeout=20
-    )
+    # Build frida-server startup command. Always bind TCP so the port is available
+    # even if the caller is in USB mode right now — switching later costs nothing.
+    start_cmd = f"nohup {REMOTE_PATH} -l 0.0.0.0:{transport.port} -D >/dev/null 2>&1 &"
+    shell.adb_script(start_cmd, serial=serial, timeout=20)
 
     import time
     for _ in range(10):
         time.sleep(1)
         if is_running(serial):
-            ok(f"frida-server {version} started on device")
-            return True, f"started {version}"
+            if transport.mode in ("tcp", "auto"):
+                _forward_port(transport.port, serial)
+            ok(f"frida-server {version} started on device (TCP :{transport.port})")
+            return True, f"started {version}, TCP :{transport.port}"
 
     enforce = shell.adb_shell(["getenforce"], serial=serial, timeout=15).stdout.strip()
     return False, (f"frida-server did not start (SELinux={enforce}). "
@@ -130,9 +143,26 @@ _FRIDA_ERRORS = (
 )
 
 
+def _device_args(serial: str | None, transport: FridaTransportConfig | None) -> list[str]:
+    """Build the frida CLI device-selection flags."""
+    transport = transport or FridaTransportConfig()
+
+    if transport.mode == "tcp":
+        return ["-H", f"{transport.host}:{transport.port}"]
+
+    if transport.mode == "usb":
+        return ["-D", serial] if serial else ["-U"]
+
+    # auto: try TCP first — if the port forward is set up, it will work; otherwise
+    # the frida CLI falls back internally. We still pass -H so the attempt is made.
+    return ["-H", f"{transport.host}:{transport.port}"]
+
+
 def run_script(package: str, script: Path, serial: str | None = None, *,
-               spawn: bool = True, duration: int = 20) -> tuple[bool, str]:
+               spawn: bool = True, duration: int = 20,
+               transport: FridaTransportConfig | None = None) -> tuple[bool, str]:
     """Run `script` against `package` for `duration` seconds and return its output."""
+    transport = transport or FridaTransportConfig()
     exe = shell.which("frida")
     if not exe:
         return False, "frida CLI not found"
@@ -140,18 +170,35 @@ def run_script(package: str, script: Path, serial: str | None = None, *,
         return False, f"script not found: {script}"
 
     argv = [exe]
-    argv += ["-D", serial] if serial else ["-U"]
+    argv += _device_args(serial, transport)
     argv += ["-l", str(script), "--runtime=v8", "-q", "-t", str(duration)]
     argv += ["-f", package] if spawn else ["-n", package]
 
+    mode_label = transport.mode
     say("frida", f"{'spawning' if spawn else 'attaching to'} {package} with {script.name} "
-                 f"({duration}s window)")
-    # +15s of slack so the subprocess timeout never fires before frida's own -t does.
+                 f"({duration}s window, {mode_label})")
     proc = shell.run(argv, timeout=duration + 15)
     output = (proc.stdout + proc.stderr).strip()
+
+    # auto mode: if TCP failed, retry with USB
+    if transport.mode == "auto" and _has_connect_error(output):
+        say("frida", f"TCP connect failed, falling back to USB")
+        argv_usb = [exe]
+        argv_usb += ["-D", serial] if serial else ["-U"]
+        argv_usb += ["-l", str(script), "--runtime=v8", "-q", "-t", str(duration)]
+        argv_usb += ["-f", package] if spawn else ["-n", package]
+        proc = shell.run(argv_usb, timeout=duration + 15)
+        output = (proc.stdout + proc.stderr).strip()
 
     if any(marker in output for marker in _FRIDA_ERRORS):
         return False, output[:800]
     if proc.timed_out:
         return False, f"frida did not exit within {duration + 15}s\n{output[:600]}"
     return True, output[:8000]
+
+
+def _has_connect_error(output: str) -> bool:
+    """Did frida fail specifically because it couldn't connect to the remote device?"""
+    markers = ("Failed to connect", "unable to connect", "Connection refused",
+               "timed out while waiting")
+    return any(m in output for m in markers)

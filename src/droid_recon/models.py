@@ -42,8 +42,12 @@ def classify_reach(
     permission: str | None,
     permission_protection: str | None,
     browsable: bool = False,
+    enabled: bool = True,
 ) -> Reach:
     """Compute who can reach a component. Manifest facts only — never probe results."""
+    if not enabled:
+        # A disabled component cannot be launched until package state changes.
+        return "none"
     if not exported:
         # Still reachable from adb shell, which is why probes against it are not findings.
         return "shell"
@@ -67,10 +71,16 @@ class IntentFilter:
 
     @property
     def browsable(self) -> bool:
-        return "android.intent.category.BROWSABLE" in self.categories
+        return (
+            "android.intent.action.VIEW" in self.actions
+            and "android.intent.category.BROWSABLE" in self.categories
+            and any(d.get("scheme") for d in self.data)
+        )
 
     def deeplinks(self) -> list[str]:
         """Concrete-ish URIs this filter would match, for probing."""
+        if not self.browsable:
+            return []
         out: list[str] = []
         for d in self.data:
             scheme = d.get("scheme")
@@ -113,20 +123,52 @@ class Component:
     reachable_from: Reach = "shell"
     issues: list[str] = field(default_factory=list)
     target_activity: str | None = None  # activity-alias
+    source_apk: str | None = None  # APK whose manifest declared this component
+    source_split: str | None = None  # None for the base APK
+    # `reachable_from` remains the provider's read reach for compatibility.
+    # The operation-specific values prevent read and write guards being conflated.
+    read_reachable_from: Reach | None = None
+    write_reachable_from: Reach | None = None
+    call_reachable_from: Reach | None = None
 
     @property
     def browsable(self) -> bool:
-        return any(f.browsable for f in self.intent_filters)
+        return (self.enabled and self.exported
+                and self.type in ("activity", "activity-alias")
+                and any(f.browsable for f in self.intent_filters))
+
+    def provider_reach(self, operation: str) -> Reach:
+        """Reach for a provider operation, falling back for older saved surfaces."""
+        if self.type != "provider":
+            return self.reachable_from
+        if operation == "read":
+            return self.read_reachable_from or self.reachable_from
+        if operation == "write":
+            return self.write_reachable_from or self.reachable_from
+        if operation == "call":
+            return self.call_reachable_from or self.reachable_from
+        raise ValueError(f"unknown provider operation: {operation}")
+
+    @property
+    def publicly_reachable(self) -> bool:
+        """Whether any manifest-declared operation admits an ordinary caller."""
+        public = ("third_party_app", "browser")
+        if self.type == "provider":
+            return any(self.provider_reach(operation) in public
+                       for operation in ("read", "write", "call"))
+        return self.reachable_from in public
 
     @property
     def send_target(self) -> bool:
-        return any(
+        return self.enabled and self.exported and any(
             a in ("android.intent.action.SEND", "android.intent.action.SEND_MULTIPLE")
             for f in self.intent_filters
             for a in f.actions
         )
 
     def deeplinks(self) -> list[str]:
+        if not self.browsable:
+            return []
         seen: list[str] = []
         for f in self.intent_filters:
             for uri in f.deeplinks():
@@ -164,6 +206,7 @@ class AttackSurface:
     package: str
     apk_paths: list[str] = field(default_factory=list)
     apk_sha256: str = ""
+    apk_sha256s: dict[str, str] = field(default_factory=dict)
     version_name: str | None = None
     version_code: int | None = None
     min_sdk: int | None = None
@@ -195,12 +238,24 @@ class AttackSurface:
             "total_components": len(self.components),
             "exported_components": len(self.exported),
             "reachable_third_party": sum(
-                1 for c in self.components if c.reachable_from in ("third_party_app", "browser")
+                1 for c in self.components if c.publicly_reachable
             ),
             "activities": len(self.by_type("activity")) + len(self.by_type("activity-alias")),
             "services": len(self.by_type("service")),
             "receivers": len(self.by_type("receiver")),
             "providers": len(self.by_type("provider")),
+            "providers_read_reachable": sum(
+                1 for c in self.by_type("provider")
+                if c.provider_reach("read") in ("third_party_app", "browser")
+            ),
+            "providers_write_reachable": sum(
+                1 for c in self.by_type("provider")
+                if c.provider_reach("write") in ("third_party_app", "browser")
+            ),
+            "providers_call_reachable": sum(
+                1 for c in self.by_type("provider")
+                if c.provider_reach("call") in ("third_party_app", "browser")
+            ),
             "components_with_issues": sum(1 for c in self.components if c.issues),
             "fileprovider_paths": len(self.fileprovider_paths),
             "permission_misconfigs": len(self.permission_misconfigs),
@@ -217,6 +272,7 @@ class AttackSurface:
             "package": self.package,
             "apk_paths": self.apk_paths,
             "apk_sha256": self.apk_sha256,
+            "apk_sha256s": self.apk_sha256s,
             "version_name": self.version_name,
             "version_code": self.version_code,
             "min_sdk": self.min_sdk,

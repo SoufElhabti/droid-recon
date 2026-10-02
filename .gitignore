@@ -27,3 +27,11 @@ build/
 .DS_Store
 *.log
 emulator.log
+
+# --- audit data / runtime (added for the public-safe repo) ---
+campaigns/
+evidence/
+test-glide/
+apk-corpus/
+state.json
+.claude/

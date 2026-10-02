@@ -186,7 +186,7 @@ def start_capture(out_dir: Path, port: int = DEFAULT_PORT,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     addon_path = out_dir / "_dr_addon.py"
-    addon_path.write_text(_ADDON)
+    addon_path.write_text(_ADDON, encoding="utf-8")
     flows_path = out_dir / "flows.jsonl"
     dump_path = out_dir / "traffic.mitm"
 
@@ -199,7 +199,7 @@ def start_capture(out_dir: Path, port: int = DEFAULT_PORT,
             "-w", str(dump_path), "--set", "confdir=" + str(MITM_HOME)]
 
     say("net", f"starting mitmdump on :{port}")
-    proc = subprocess.Popen(argv, stdout=open(out_dir / "mitmdump.log", "w"),
+    proc = subprocess.Popen(argv, stdout=open(out_dir / "mitmdump.log", "w", encoding="utf-8"),
                             stderr=subprocess.STDOUT, env=env, start_new_session=True)
 
     for _ in range(20):
@@ -229,7 +229,7 @@ def read_flows(flows_path: Path) -> list[dict]:
     if not flows_path.exists():
         return []
     out = []
-    for line in flows_path.read_text(errors="replace").splitlines():
+    for line in flows_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -364,9 +364,9 @@ def export_har(records: list[dict], dest: Path) -> Path:
             "cache": {}, "timings": {"send": 0, "wait": 0, "receive": 0},
         })
     har = {"log": {"version": "1.2",
-                   "creator": {"name": "droid-recon", "version": "0.2.0"},
+                   "creator": {"name": "droid-recon", "version": "0.3.0"},
                    "entries": entries}}
-    dest.write_text(json.dumps(har, indent=2))
+    dest.write_text(json.dumps(har, indent=2), encoding="utf-8")
     return dest
 
 
