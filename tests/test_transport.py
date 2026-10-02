@@ -12,7 +12,6 @@ from droid_recon.cli import build_parser
 from droid_recon.frida import server
 from droid_recon.transport import FridaTransportConfig, TransportConfig
 
-
 # ---- FridaTransportConfig ----
 
 def test_config_defaults():
@@ -99,6 +98,9 @@ def test_connect_error_detected():
 def test_no_false_connect_error():
     assert not server._has_connect_error("[ssl_unpin] Interceptor.attach(...)")
     assert not server._has_connect_error("console.log('hello')")
+    assert not server._has_connect_error(
+        "unexpectedly timed out while waiting for stop from process with PID 1130"
+    )
     assert not server._has_connect_error("")
 
 

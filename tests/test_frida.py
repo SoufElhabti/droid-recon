@@ -90,6 +90,26 @@ def test_run_script_returns_complete_output(monkeypatch, tmp_path):
     assert output.endswith("TAIL")
 
 
+def test_attach_uses_application_identifier(monkeypatch, tmp_path):
+    script = tmp_path / "trace.js"
+    script.write_text("console.log('x');")
+    seen = []
+    monkeypatch.setattr(server.shell, "which", lambda name: "/frida")
+
+    def fake_run(argv, timeout):
+        seen.append(argv)
+        return shell.Proc(argv, 0, "attached", "")
+
+    monkeypatch.setattr(server.shell, "run", fake_run)
+
+    good, _ = server.run_script("com.example.app", script, spawn=False, duration=1)
+
+    assert good is True
+    assert "-N" in seen[0]
+    assert seen[0][seen[0].index("-N") + 1] == "com.example.app"
+    assert "-n" not in seen[0]
+
+
 def test_app_event_error_words_do_not_masquerade_as_frida_failure(monkeypatch, tmp_path):
     script = tmp_path / "trace.js"
     script.write_text("console.log('x');")

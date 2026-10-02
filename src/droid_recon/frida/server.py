@@ -10,11 +10,11 @@ note rather than aborting the audit. Development rule 9: fail open on non-critic
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import lzma
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import shell
@@ -88,7 +88,12 @@ def ensure_server(serial: str | None = None,
     transport = transport or FridaTransportConfig()
     version = host_version()
     if not version:
-        return False, "frida CLI not found on PATH (pip install frida-tools)"
+        exe = shell.which("frida")
+        if not exe:
+            return False, "frida CLI not found on PATH (pip install frida-tools)"
+        probe = shell.run([exe, "--version"], timeout=30)
+        detail = (probe.stderr or probe.stdout).strip()[-600:]
+        return False, f"frida CLI is installed but not runnable: {detail or 'no version output'}"
 
     if is_running(serial):
         if transport.mode in ("tcp", "auto"):
@@ -207,7 +212,7 @@ def run_script(package: str, script: Path, serial: str | None = None, *,
     argv = [exe]
     argv += _device_args(serial, transport)
     argv += ["-l", str(script), "--runtime=v8", "-q", "-t", str(duration)]
-    argv += ["-f", package] if spawn else ["-n", package]
+    argv += ["-f", package] if spawn else ["-N", package]
 
     mode_label = transport.mode
     say("frida", f"{'spawning' if spawn else 'attaching to'} {package} with {script.name} "
@@ -221,7 +226,7 @@ def run_script(package: str, script: Path, serial: str | None = None, *,
         argv_usb = [exe]
         argv_usb += ["-D", serial] if serial else ["-U"]
         argv_usb += ["-l", str(script), "--runtime=v8", "-q", "-t", str(duration)]
-        argv_usb += ["-f", package] if spawn else ["-n", package]
+        argv_usb += ["-f", package] if spawn else ["-N", package]
         proc = shell.run(argv_usb, timeout=duration + 15)
         output = (proc.stdout + proc.stderr).strip()
 
@@ -235,5 +240,5 @@ def run_script(package: str, script: Path, serial: str | None = None, *,
 def _has_connect_error(output: str) -> bool:
     """Did frida fail specifically because it couldn't connect to the remote device?"""
     markers = ("Failed to connect", "unable to connect", "Connection refused",
-               "timed out while waiting")
+               "timed out while waiting for device")
     return any(m in output for m in markers)

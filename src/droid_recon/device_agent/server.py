@@ -16,14 +16,16 @@ import hmac
 import json
 import os
 import subprocess
-import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from io import BytesIO
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 VERSION = "0.1.0"
 MAX_BODY = 4 * 1024 * 1024  # 4 MB request body limit
 CLOCK_SKEW = 120  # seconds
+
+
+class AgentHTTPServer(HTTPServer):
+    auth_secret: str
 
 
 def _run(argv, timeout=60):
@@ -70,6 +72,7 @@ def _run_script(script, timeout=60):
 
 class AgentHandler(BaseHTTPRequestHandler):
     server_version = f"droid-recon-agent/{VERSION}"
+    server: AgentHTTPServer
 
     def log_message(self, fmt, *args):
         pass  # silent — logs go to stderr which adb captures
@@ -200,7 +203,7 @@ def main():
     p.add_argument("--secret", default="")
     args = p.parse_args()
 
-    server = HTTPServer(("127.0.0.1", args.port), AgentHandler)
+    server = AgentHTTPServer(("127.0.0.1", args.port), AgentHandler)
     server.auth_secret = args.secret
     print(f"[agent] listening on 127.0.0.1:{args.port} (pid={os.getpid()})", flush=True)
     try:

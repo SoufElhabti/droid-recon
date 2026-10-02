@@ -25,7 +25,7 @@ dotlottie-android 0.15.0 AAR:
 - Harness APK SHA-256:
   `1e53a69352dca748624df04b67e8945dba454e32e882c9c69a0889d6272e4a05`
 - APK:
-  `/Users/soufianeelhabti/lottie/audit-dotlottie-native-20260802/harness/android-key-timing-poc/evidence/dotlottie-time-setter-reclaim.apk`
+  `$HOME/lottie/audit-dotlottie-native-20260802/harness/android-key-timing-poc/evidence/dotlottie-time-setter-reclaim.apk`
 
 The report classified `dotlottie` and `dotlottie-native-thorvg-expressions` as present.
 Q5 (`dotLottie`) and Q6 (`expressions`) were both `true / high`, with the four expression

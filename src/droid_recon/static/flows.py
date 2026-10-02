@@ -13,7 +13,6 @@ from pathlib import Path
 
 from ..models import AttackSurface, Component
 
-
 _NON_CODE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/', re.S)
 _METHOD = re.compile(
     r"(?m)^[ \t]*(?:(?:public|private|protected|static|final|synchronized|native|abstract)\s+)*"

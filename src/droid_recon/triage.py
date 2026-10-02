@@ -109,7 +109,7 @@ def _story(obs: Observation, comp: Component | None) -> tuple[dict, dict, list[s
             "code_excerpt": obs.stdout_excerpt[:300],
         }
         chain = [
-            f"Attacker app declares no special permission"
+            "Attacker app declares no special permission"
             + (f" (or holds {guard}, protection level allows it)" if guard else ""),
             f"Attacker calls ContentResolver.query(Uri.parse(\"{uri}\"))",
             f"Provider {cname} is exported with no effective read guard",

@@ -17,6 +17,34 @@ def _sdk_ready() -> bool:
                 list((sdk / "platforms").glob("android-*/android.jar")))
 
 
+def test_gradle_build_isolated_from_source_tree(tmp_path, monkeypatch):
+    project = tmp_path / "source"
+    (project / "app" / "src" / "main").mkdir(parents=True)
+    (project / "settings.gradle").write_text("include ':app'\n", encoding="utf-8")
+    (project / "app" / "src" / "main" / "marker.txt").write_text(
+        "source", encoding="utf-8"
+    )
+    build_root = tmp_path / "out"
+
+    def fake_run(argv, *, timeout, cwd=None, **kwargs):
+        isolated = type(project)(cwd)
+        generated = isolated / "app" / "build" / "outputs" / "apk" / "debug"
+        generated.mkdir(parents=True)
+        (generated / "app-debug.apk").write_bytes(b"gradle-apk")
+        return shell.Proc(list(argv), 0, "BUILD SUCCESSFUL\n", "")
+
+    monkeypatch.setattr(ordinary.shell, "which", lambda name, *paths: "/tools/gradle")
+    monkeypatch.setattr(ordinary.shell, "run", fake_run)
+
+    built = ordinary.build_companion(project, build_root=build_root)
+
+    assert built.status == "built"
+    assert built.apk == build_root / "droid-recon-companion.apk"
+    assert built.apk.read_bytes() == b"gradle-apk"
+    assert not (project / ".gradle").exists()
+    assert not (project / "app" / "build").exists()
+
+
 @pytest.mark.skipif(not _sdk_ready(), reason="Android SDK and JDK not installed")
 def test_offline_companion_apk_has_dex_no_permissions_and_valid_signature(
     tmp_path, monkeypatch,
@@ -65,8 +93,10 @@ def test_offline_companion_apk_has_dex_no_permissions_and_valid_signature(
     )
     assert signature.ok, signature.stderr
     assert "Verified using v2 scheme (APK Signature Scheme v2): true" in signature.stdout
-    cert = re.search(r"Signer #1 certificate SHA-256 digest: ([0-9a-f]+)",
-                     signature.stdout)
+    cert = re.search(
+        r"(?m)^.*Signer.*certificate SHA-256 digest: ([0-9a-f]+)",
+        signature.stdout,
+    )
     assert cert, signature.stdout
 
     # A rebuild must retain the signing key so adb install -r can update the app.

@@ -1,6 +1,6 @@
 """Host capability checks must not require an Android SDK to test."""
 
-from droid_recon import doctor
+from droid_recon import doctor, shell
 
 
 def test_doctor_reports_stage_availability_without_executing_tools():
@@ -16,12 +16,34 @@ def test_doctor_reports_stage_availability_without_executing_tools():
     assert result["capabilities"]["network"] is False
 
 
+def test_doctor_does_not_claim_broken_frida_is_available(monkeypatch):
+    installed = {"adb": "/tools/adb", "frida": "/tools/frida"}
+    monkeypatch.setattr(shell, "which", lambda name, *paths: installed.get(name))
+    monkeypatch.setattr(
+        shell,
+        "run",
+        lambda argv, **kwargs: shell.Proc(list(argv), 1, "", "ImportError: broken frida"),
+    )
+
+    result = doctor.inspect(
+        sdk_home=lambda: None,
+        avd_list=lambda: [],
+        device_list=lambda: [],
+    )
+
+    assert result["tools"]["frida"] == "/tools/frida"
+    assert result["tool_health"]["frida"]["runnable"] is False
+    assert result["capabilities"]["frida"] is False
+
+
 def test_doctor_distinguishes_emulator_binary_from_configured_avd(tmp_path):
     sdk = tmp_path / "sdk"
     (sdk / "platforms" / "android-35").mkdir(parents=True)
     (sdk / "platforms" / "android-35" / "android.jar").write_bytes(b"fixture")
     installed = {"adb", "emulator", "aapt2", "java", "javac"}
-    lookup = lambda name, *paths: f"/tools/{name}" if name in installed else None
+    def lookup(name, *paths):
+        return f"/tools/{name}" if name in installed else None
+
     absent = doctor.inspect(find=lookup, sdk_home=lambda: sdk,
                             avd_list=lambda: [], device_list=lambda: [])
     assert absent["capabilities"]["device"] is False
@@ -61,9 +83,13 @@ def test_doctor_follows_relative_avd_pointer_and_ignores_traversal(tmp_path, mon
     monkeypatch.setenv("ANDROID_USER_HOME", str(user_home))
     monkeypatch.delenv("ANDROID_AVD_HOME", raising=False)
 
-    inspect = lambda: doctor.inspect(find=lambda name, *paths: None,
-                                     sdk_home=lambda: None,
-                                     avd_list=lambda: ["lab"], device_list=lambda: [])
+    def inspect():
+        return doctor.inspect(
+            find=lambda name, *paths: None,
+            sdk_home=lambda: None,
+            avd_list=lambda: ["lab"],
+            device_list=lambda: [],
+        )
     assert inspect()["avds"][0]["abi"] == "arm64-v8a"
 
     (relative_avd / "config.ini").unlink()

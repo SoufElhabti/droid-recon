@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
@@ -222,6 +221,45 @@ def test_install_does_not_autogrant_permissions(monkeypatch, tmp_path):
     assert installed.status == "installed"
     assert installed.verified_build is False
     assert calls == [("install", "-r", str(apk))]
+
+
+def test_verified_build_replaces_stale_companion_signing_identity(monkeypatch, tmp_path):
+    apk = tmp_path / "app.apk"
+    with ZipFile(apk, "w") as archive:
+        archive.writestr("AndroidManifest.xml", b"fixture")
+    digest = ordinary._apk_sha256(apk)
+    monkeypatch.setattr(ordinary, "TRUSTED_RELEASE_APK_SHA256S", frozenset({digest}))
+    monkeypatch.setattr(ordinary, "_emulator_serial", lambda serial: "emulator-5554")
+    calls = []
+
+    def fake_adb(*args, serial, timeout):
+        calls.append(args)
+        if args[:2] == ("install", "-r"):
+            return shell.Proc(
+                list(args), 1, "",
+                "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures differ]",
+            )
+        return shell.Proc(list(args), 0, "Success\n", "")
+
+    monkeypatch.setattr(ordinary.shell, "adb", fake_adb)
+    monkeypatch.setattr(
+        ordinary.shell,
+        "adb_shell",
+        lambda *args, **kwargs: shell.Proc(
+            list(args), 0, "package:/data/app/org.droidrecon.companion/base.apk\n", ""
+        ),
+    )
+
+    installed = ordinary.install_companion(apk, serial="emulator-5554")
+
+    assert installed.status == "installed"
+    assert installed.verified_build is True
+    assert "replaced stale" in installed.message
+    assert calls == [
+        ("install", "-r", str(apk)),
+        ("uninstall", ordinary.COMPANION_PACKAGE),
+        ("install", str(apk)),
+    ]
 
 
 @pytest.mark.parametrize("unsafe_manifest,reason", [

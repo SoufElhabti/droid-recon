@@ -24,7 +24,6 @@ This is all destroyed on reboot, which is fine — it is a per-session operation
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
 from .. import shell
@@ -71,8 +70,8 @@ def _running_app_pids(serial: str | None) -> list[str]:
     """Pids worth entering: zygote (template for future apps) + live app processes."""
     pids: list[str] = []
     for name in ("zygote64", "zygote"):
-        p = shell.adb_shell(["pidof", name], serial=serial, timeout=20)
-        pids += p.stdout.split()
+        proc = shell.adb_shell(["pidof", name], serial=serial, timeout=20)
+        pids += proc.stdout.split()
 
     # Any process whose cmdline looks like an app package, so already-running targets
     # pick the new store up without a restart.
@@ -82,11 +81,12 @@ def _running_app_pids(serial: str | None) -> list[str]:
         if len(parts) == 2 and "." in parts[1] and not parts[1].startswith("/"):
             pids.append(parts[0])
 
-    seen, out = set(), []
-    for p in pids:
-        if p.isdigit() and p not in seen:
-            seen.add(p)
-            out.append(p)
+    seen: set[str] = set()
+    out: list[str] = []
+    for pid in pids:
+        if pid.isdigit() and pid not in seen:
+            seen.add(pid)
+            out.append(pid)
     return out
 
 

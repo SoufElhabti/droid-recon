@@ -13,13 +13,12 @@ then the report asks for dynamic confirmation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
-from pathlib import Path
 import re
-from typing import Iterable, Mapping
 import zipfile
-
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Mapping
 
 SCHEMA_VERSION = 1
 MAX_EVIDENCE = 24
@@ -609,7 +608,7 @@ def _scan_archives(apks: list[Path], state: _State) -> None:
                                 _B64_RAW_WRITE_NATIVE_MARKERS)
                             if (dotlottie_api and
                                     len(expression_api) >= 3):
-                                evidence = {
+                                evidence: dict[str, object] = {
                                     "kind": "native_dotlottie_thorvg_expression_engine",
                                     "value": "dotLottie native player with ThorVG expressions",
                                     "file": archive_file,

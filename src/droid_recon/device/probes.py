@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from .. import shell
-from ..log import say
-from ..models import Component, Observation
+from ..models import Component, Observation, Reach
 from . import logcat
+
+if TYPE_CHECKING:
+    from ..device_agent.client import DeviceAgentClient
 
 PROBE_TIMEOUT = 30
 
@@ -47,7 +49,7 @@ class ProbeContext:
     serial: str | None = None
     capture_logcat: bool = True
     counter: int = 0
-    agent: object = None  # DeviceAgentClient | None
+    agent: DeviceAgentClient | None = None
 
     def next_id(self, kind: str) -> str:
         self.counter += 1
@@ -60,7 +62,7 @@ def _excerpt(text: str, limit: int = 600) -> str:
 
 
 def _run_probe(ctx: ProbeContext, kind: str, argv: list[str], component: Component | None,
-               *, reach_override: str | None = None) -> Observation:
+               *, reach_override: Reach | None = None) -> Observation:
     """Run one device command and wrap it as an Observation with manifest-derived reach."""
     from ..device_agent.runtime import exec_on_device
 

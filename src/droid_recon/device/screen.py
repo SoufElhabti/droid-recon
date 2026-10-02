@@ -13,7 +13,6 @@ from datetime import datetime
 from pathlib import Path
 
 from .. import shell
-from ..log import warn
 
 REMOTE_PNG = "/data/local/tmp/droid-recon-screen.png"
 REMOTE_UI = "/data/local/tmp/droid-recon-ui.xml"

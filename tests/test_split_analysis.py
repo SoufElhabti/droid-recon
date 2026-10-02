@@ -10,7 +10,6 @@ import pytest
 
 from droid_recon.static import decompile, manifest
 
-
 ANDROID_NS = 'xmlns:android="http://schemas.android.com/apk/res/android"'
 
 

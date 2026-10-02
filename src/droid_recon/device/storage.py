@@ -15,7 +15,6 @@ import re
 from pathlib import Path
 
 from .. import shell
-from ..log import say, warn
 
 SECRET_HINT = re.compile(
     r"(password|passwd|secret|token|api[_-]?key|auth|bearer|credential|private[_-]?key|"
@@ -98,7 +97,7 @@ def scan_prefs_for_secrets(dest: Path) -> list[dict]:
 
 
 def list_databases(dest: Path) -> list[dict]:
-    out = []
+    out: list[dict] = []
     dbs = dest / "databases"
     if not dbs.is_dir():
         return out

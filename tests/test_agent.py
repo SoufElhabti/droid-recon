@@ -30,7 +30,10 @@ def _asst(content=None, tool_calls=None):
 def test_tool_bridge_exposes_all_mcp_tools():
     tools = A.openai_tools()
     from droid_recon import mcp_server
-    assert len(tools) == len(mcp_server.TOOLS) == 30
+    assert len(tools) == len(mcp_server.TOOLS)
+    assert {tool["function"]["name"] for tool in tools} == {
+        tool["name"] for tool in mcp_server.TOOLS
+    }
     for t in tools:
         assert t["type"] == "function"
         fn = t["function"]
@@ -57,7 +60,8 @@ def test_full_turn_executes_a_real_tool_and_gets_a_final_answer():
 
     assert out == "No session exists yet; start with static_analyze."
     # the model was actually offered the tool schemas
-    assert seen["tools_sent"] and len(seen["tools_sent"]) == 30
+    from droid_recon import mcp_server
+    assert seen["tools_sent"] and len(seen["tools_sent"]) == len(mcp_server.TOOLS)
     # a real tool result made it into the history and carried genuine handler output
     tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
     assert len(tool_msgs) == 1

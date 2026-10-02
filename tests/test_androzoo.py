@@ -7,10 +7,7 @@ import gzip
 import hashlib
 from pathlib import Path
 
-import pytest
-
 from droid_recon.corpus import androzoo
-
 
 HEADER = ["sha256", "sha1", "md5", "dex_date", "apk_size", "pkg_name",
           "vercode", "vt_detection", "vt_scan_date", "dex_size", "markets"]
@@ -64,6 +61,15 @@ def test_resolve_ignores_unrequested_packages_and_empty_input(tmp_path):
     assert androzoo.resolve(index, ["com.absent"]) == {}
 
 
+def test_resolve_rejects_unsafe_package_names_and_invalid_hashes(tmp_path):
+    index = _index(tmp_path / "i.csv.gz", [
+        _row("not-a-sha256", "com.target", "1", "play.google.com"),
+        _row("a" * 64, "../../escape", "1", "play.google.com"),
+    ])
+
+    assert androzoo.resolve(index, ["com.target", "../../escape"]) == {}
+
+
 def test_verify_rejects_a_mismatched_artifact(tmp_path):
     apk = tmp_path / "x.apk"
     apk.write_bytes(b"real bytes")
@@ -71,6 +77,68 @@ def test_verify_rejects_a_mismatched_artifact(tmp_path):
 
     assert androzoo.verify(apk, good) is True
     assert androzoo.verify(apk, "0" * 64) is False
+    assert androzoo.verify(apk, "not-a-sha256") is False
+
+
+class _Response:
+    def __init__(self, body: bytes, content_length: str | None = None):
+        self._body = body
+        self._offset = 0
+        self.headers = {"Content-Length": content_length} if content_length else {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, size: int) -> bytes:
+        chunk = self._body[self._offset:self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+def test_download_is_atomic_and_streamed(tmp_path, monkeypatch):
+    body = b"real apk bytes"
+    sha256 = hashlib.sha256(body).hexdigest()
+    dest = tmp_path / "target.apk"
+    dest.write_bytes(b"old")
+    monkeypatch.setattr(
+        androzoo.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(body, str(len(body))),
+    )
+
+    downloaded = androzoo.download(sha256, "SECRET", dest)
+
+    assert downloaded == dest
+    assert dest.read_bytes() == body
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_size_failure_keeps_existing_file_and_removes_partial(tmp_path, monkeypatch):
+    dest = tmp_path / "target.apk"
+    dest.write_bytes(b"known-good")
+    monkeypatch.setattr(androzoo, "MAX_APK_BYTES", 3)
+    monkeypatch.setattr(
+        androzoo.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(b"too large"),
+    )
+
+    assert androzoo.download("a" * 64, "SECRET", dest) is None
+    assert dest.read_bytes() == b"known-good"
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_rejects_invalid_hash_before_network(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        androzoo.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network used")),
+    )
+
+    assert androzoo.download("../bad", "SECRET", tmp_path / "target.apk") is None
 
 
 def test_fetch_discards_an_artifact_whose_hash_does_not_match(tmp_path, monkeypatch):

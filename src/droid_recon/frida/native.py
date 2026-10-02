@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .. import shell
 from ..log import say
 
 # ---- generated Frida scripts ----
@@ -161,7 +160,8 @@ def list_native_libs(package: str, serial: str | None = None,
 def loaded_modules(package: str, serial: str | None = None,
                    *, agent=None) -> list[str]:
     """.so files currently mapped into the running process — the ones worth hooking."""
-    from ..device_agent.runtime import exec_on_device, exec_script as _exec_script
+    from ..device_agent.runtime import exec_on_device
+    from ..device_agent.runtime import exec_script as _exec_script
     pid = exec_on_device(["pidof", package], agent=agent, serial=serial,
                          timeout=20).stdout.strip().split()
     if not pid:

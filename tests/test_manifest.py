@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from droid_recon.models import classify_reach
 from droid_recon import shell
+from droid_recon.models import classify_reach
 from droid_recon.static import manifest
 from droid_recon.static.manifest import parse_manifest
 

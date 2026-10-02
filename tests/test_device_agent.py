@@ -9,11 +9,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -22,7 +20,6 @@ from droid_recon.cli import build_parser
 from droid_recon.device_agent.client import DeviceAgentClient
 from droid_recon.device_agent.runtime import exec_on_device, exec_script
 from droid_recon.transport import DeviceAgentConfig, TransportConfig
-
 
 # ---- DeviceAgentConfig ----
 

@@ -10,7 +10,6 @@ from pathlib import Path
 from . import shell
 from .models import AttackSurface, utcnow
 
-
 _CERT_SHA256 = re.compile(r"certificate SHA-256 digest:\s*([0-9a-fA-F:]+)", re.I)
 _CONFIG_KEYS = (
     "type", "limit", "screenshots", "traversal", "include_shell_only",
@@ -93,10 +92,10 @@ def record(
         except (OSError, json.JSONDecodeError):
             previous = {}
 
-    apks = []
+    apks: list[dict[str, object]] = []
     for raw in surface.apk_paths:
         apk = Path(raw)
-        entry = {"path": str(apk)}
+        entry: dict[str, object] = {"path": str(apk)}
         if apk.is_file():
             entry["sha256"] = _sha256(apk)
             entry["signing_certificate"] = signing_fingerprint(apk)

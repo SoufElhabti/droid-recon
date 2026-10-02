@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 _LOG_FILE: Path | None = None
 _QUIET = False
@@ -47,6 +48,6 @@ def ok(msg: str) -> None:
     _emit("+", msg)
 
 
-def die(msg: str, code: int = 1) -> None:
+def die(msg: str, code: int = 1) -> NoReturn:
     _emit("x", msg)
     raise SystemExit(code)

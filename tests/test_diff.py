@@ -1,6 +1,7 @@
+from zipfile import ZipFile
+
 from droid_recon.diff import compare
 from droid_recon.models import AttackSurface, Component
-from zipfile import ZipFile
 
 
 def test_diff_highlights_new_external_entry_point_and_permission_change():

@@ -19,10 +19,10 @@ import re
 import signal
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from .. import shell
+from .. import __version__, shell
 from ..log import ok, say, warn
 
 DEFAULT_PORT = 8080
@@ -364,7 +364,7 @@ def export_har(records: list[dict], dest: Path) -> Path:
             "cache": {}, "timings": {"send": 0, "wait": 0, "receive": 0},
         })
     har = {"log": {"version": "1.2",
-                   "creator": {"name": "droid-recon", "version": "0.3.0"},
+                   "creator": {"name": "droid-recon", "version": __version__},
                    "entries": entries}}
     dest.write_text(json.dumps(har, indent=2), encoding="utf-8")
     return dest

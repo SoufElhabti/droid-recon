@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 CATALOG_VERSION = "2026-10-01-owasp-mas-v2"
 CHECKED_ON = "2026-10-01"
 UPSTREAM_VERSIONS = {

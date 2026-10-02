@@ -9,8 +9,8 @@ Ported from android-privesc-hunt/scripts/pre-analyze.sh:55-180.
 
 from __future__ import annotations
 
-import hashlib
 import copy
+import hashlib
 import re
 import xml.etree.ElementTree as ET
 import zipfile
@@ -356,11 +356,11 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
     )
 
     declared: dict[str, str] = {}
-    for perm in root.findall("permission"):
-        name = _attr(perm, "name")
+    for permission_el in root.findall("permission"):
+        name = _attr(permission_el, "name")
         if not name:
             continue
-        level = (_attr(perm, "protectionLevel") or "normal").lower()
+        level = (_attr(permission_el, "protectionLevel") or "normal").lower()
         # aapt2/apkanalyzer sometimes emit the raw flag int.
         if level.startswith("0x") or level.isdigit():
             level = _decode_protection_flags(level)
@@ -418,32 +418,33 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
             else:
                 inferred, source = explicit, "explicit"
 
-            perm = _attr(el, "permission") or _attr(app, "permission")
+            component_permission = _attr(el, "permission") or _attr(app, "permission")
             read_perm = _attr(el, "readPermission")
             write_perm = _attr(el, "writePermission")
+            target_name = _attr(el, "targetActivity")
 
             comp = Component(
                 name=name,
                 type=ctype,
                 exported=bool(inferred),
                 exported_source=source,
-                permission=perm,
+                permission=component_permission,
                 read_permission=read_perm,
                 write_permission=write_perm,
                 authorities=[a for a in (_attr(el, "authorities") or "").split(";") if a],
                 grant_uri_permissions=bool(_bool_attr(el, "grantUriPermissions", False)),
                 enabled=app_enabled and bool(_bool_attr(el, "enabled", True)),
                 intent_filters=filters,
-                target_activity=(_qualified_component_name(_attr(el, "targetActivity"), pkg)
-                                 if _attr(el, "targetActivity") else None),
+                target_activity=(_qualified_component_name(target_name, pkg)
+                                 if target_name else None),
             )
 
             if ctype == "provider":
                 # A provider has separate read and write gates. Path-specific guards
                 # and temporary URI grants can change reach for individual URIs, so
                 # these are conservative provider-wide candidates, not proof of access.
-                read_guard = read_perm or perm
-                write_guard = write_perm or perm
+                read_guard = read_perm or component_permission
+                write_guard = write_perm or component_permission
                 comp.read_reachable_from = classify_reach(
                     exported=comp.exported, enabled=comp.enabled,
                     permission=read_guard,
@@ -465,8 +466,8 @@ def parse_manifest(xml_text: str, apk_paths: list[Path] | None = None) -> Attack
             else:
                 comp.reachable_from = classify_reach(
                     exported=comp.exported, enabled=comp.enabled,
-                    permission=perm,
-                    permission_protection=_protection_of(perm, declared),
+                    permission=component_permission,
+                    permission_protection=_protection_of(component_permission, declared),
                     browsable=comp.browsable,
                 )
             comp.issues = _component_issues(comp, pkg)
@@ -588,30 +589,33 @@ def _merged_manifest(
                     added.set(ANDROID_NS + "permission", split_permission)
                 merged_app.append(added)
 
-    permission_defs: dict[str, str] = {
-        _attr(el, "name"): _attr(el, "protectionLevel") or "normal"
-        for el in merged.findall("permission") if _attr(el, "name")
-    }
+    permission_defs: dict[str, str] = {}
+    for permission_el in merged.findall("permission"):
+        permission_name = _attr(permission_el, "name")
+        if permission_name:
+            permission_defs[permission_name] = (
+                _attr(permission_el, "protectionLevel") or "normal"
+            )
     for apk, root, split in ordered[1:]:
         for tag in ("uses-permission", "uses-permission-sdk-23"):
             for el in root.findall(tag):
                 merged.append(copy.deepcopy(el))
         for el in root.findall("permission"):
-            name = _attr(el, "name")
-            if not name:
+            permission_name = _attr(el, "name")
+            if not permission_name:
                 continue
             level = _attr(el, "protectionLevel") or "normal"
-            previous = permission_defs.get(name)
+            previous = permission_defs.get(permission_name)
             if previous is not None:
                 def normalized(value: str) -> str:
                     return _decode_protection_flags(value) if value.startswith("0x") or value.isdigit() else value.lower()
                 if normalized(previous) != normalized(level):
                     raise ValueError(
-                        f"conflicting protectionLevel for {name} in {apk}: "
+                        f"conflicting protectionLevel for {permission_name} in {apk}: "
                         f"{previous!r} vs {level!r}"
                     )
                 continue
-            permission_defs[name] = level
+            permission_defs[permission_name] = level
             merged.append(copy.deepcopy(el))
 
     paths = [entry[0] for entry in ordered]

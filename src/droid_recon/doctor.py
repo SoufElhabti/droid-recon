@@ -7,13 +7,17 @@ are available instead of treating a skipped stage as a clean security result.
 
 from __future__ import annotations
 
-import platform
 import os
+import platform
 import sys
 from collections.abc import Callable
 from pathlib import Path, PureWindowsPath
 
 from . import shell
+
+
+def _empty_list() -> list:
+    return []
 
 
 def _ini_values(path: Path) -> dict[str, str]:
@@ -50,7 +54,7 @@ def _avd_config(avd_home: Path, user_home: Path, name: str) -> Path | None:
 def inspect(
     *,
     find: Callable[..., str | None] | None = None,
-    sdk_home: Callable[[], object | None] | None = None,
+    sdk_home: Callable[[], Path | None] | None = None,
     avd_list: Callable[[], list[str]] | None = None,
     device_list: Callable[[], list[str]] | None = None,
 ) -> dict:
@@ -76,14 +80,25 @@ def inspect(
     if find is shell.which and paths["aapt2"] is None:
         paths["aapt2"] = shell.aapt2_path()
 
+    tool_health: dict[str, dict] = {}
+    frida_runnable = bool(paths["frida"])
+    if native_lookup and paths["frida"]:
+        probe = shell.run([paths["frida"], "--version"], timeout=15)
+        frida_runnable = probe.ok and bool(probe.stdout.strip())
+        tool_health["frida"] = {
+            "runnable": frida_runnable,
+            "version": probe.stdout.strip() or None,
+            "error": None if frida_runnable else (probe.stderr or probe.stdout).strip()[-800:],
+        }
+
     if avd_list is None:
         if native_lookup and paths["emulator"]:
             from .device import emulator
             avd_list = emulator.list_avds
         else:
-            avd_list = lambda: []
+            avd_list = _empty_list
     if device_list is None:
-        device_list = shell.devices if native_lookup and paths["adb"] else lambda: []
+        device_list = shell.devices if native_lookup and paths["adb"] else _empty_list
     avds = avd_list()
     attached = device_list()
     platform_jars = (sorted((Path(sdk) / "platforms").glob("android-*/android.jar"))
@@ -109,7 +124,7 @@ def inspect(
         "attached_device": bool(attached),
         "companion_build": bool(paths["java"] and paths["javac"] and
                                 paths["aapt2"] and platform_jars),
-        "frida": bool(paths["adb"] and paths["frida"]),
+        "frida": bool(paths["adb"] and frida_runnable),
         "network": bool(paths["adb"] and paths["mitmdump"]),
         "native": bool(paths["analyzeHeadless"]),
     }
@@ -124,8 +139,9 @@ def inspect(
         "attached_devices": attached,
         "android_platforms": [path.parent.name for path in platform_jars],
         "tools": paths,
+        "tool_health": tool_health,
         "capabilities": capabilities,
         "missing_capabilities": missing,
-        "note": ("This inventories local tools, AVD configuration, and attached serials; "
-                 "it does not prove device readiness or APK compatibility."),
+        "note": ("This inventories local tools, smoke-checks the Frida CLI, and reports "
+                 "AVD/device configuration; it does not prove APK compatibility."),
     }

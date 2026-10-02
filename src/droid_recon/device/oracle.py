@@ -22,10 +22,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from .. import shell
-from ..log import say
 from . import logcat, payloads, screen
 
 

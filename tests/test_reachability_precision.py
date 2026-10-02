@@ -8,7 +8,6 @@ from droid_recon.device import probes
 from droid_recon.models import AttackSurface, classify_reach
 from droid_recon.static.manifest import parse_manifest
 
-
 NS = 'xmlns:android="http://schemas.android.com/apk/res/android"'
 
 

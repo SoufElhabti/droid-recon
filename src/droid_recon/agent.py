@@ -445,7 +445,8 @@ def repl(agent: Agent, *, color: bool = True) -> int:
         if line in ("/exit", "/quit"):
             return 0
         if line == "/help":
-            print(HELP); continue
+            print(HELP)
+            continue
         if line == "/tools":
             for t in mcp_server.TOOLS:
                 ro = "ro" if t["name"] in READ_ONLY else "!!"
@@ -461,15 +462,19 @@ def repl(agent: Agent, *, color: bool = True) -> int:
             continue
         if line == "/reset":
             agent.messages = agent.messages[:1]
-            print("  conversation cleared"); continue
+            print("  conversation cleared")
+            continue
         if line == "/preview":
-            print(preview_outbound(agent.messages)); continue
+            print(preview_outbound(agent.messages))
+            continue
         if line.startswith("/save"):
             parts = line.split(maxsplit=1)
             p = _save_transcript(agent, Path(parts[1]) if len(parts) == 2 else None)
-            print(f"  saved -> {p}"); continue
+            print(f"  saved -> {p}")
+            continue
         if line.startswith("/"):
-            print(f"  unknown command: {line} (/help)"); continue
+            print(f"  unknown command: {line} (/help)")
+            continue
         try:
             agent.run_turn(line)
         except DeepSeekError as exc:

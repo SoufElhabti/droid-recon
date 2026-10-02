@@ -16,18 +16,38 @@ import os
 import sys
 from pathlib import Path
 
-from . import diff as apk_diff
 from . import apk_identity, doctor, evidence, log, report, runs, shell, triage
-from .device import (bootstrap, certs, emulator, exploit, explorer, install, network, ordinary,
-                     payloads, probes, screen, storage)
+from . import chains as chains_mod
+from . import diff as apk_diff
+from .device import (
+    bootstrap,
+    certs,
+    emulator,
+    exploit,
+    explorer,
+    install,
+    network,
+    ordinary,
+    probes,
+    screen,
+    storage,
+)
+from .device_agent.deploy import ensure_agent
 from .log import die, ok, say, warn
 from .models import SessionState
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, flows, ghidra, intents, lottie, manifest, resources, sweep, urimatcher
-from . import chains as chains_mod
-from .transport import FridaTransportConfig, TransportConfig
-from .device_agent.deploy import ensure_agent
-
+from .static import (
+    decompile,
+    flows,
+    ghidra,
+    intents,
+    lottie,
+    manifest,
+    resources,
+    sweep,
+    urimatcher,
+)
+from .transport import TransportConfig
 
 # ---- helpers ----
 
@@ -48,7 +68,7 @@ def _session_for(surface, args) -> Session:
     return Session.open(surface.package, Path(args.sessions))
 
 
-def _pick_serial(args) -> str | None:
+def _pick_serial(args) -> str:
     if getattr(args, "serial", None):
         return args.serial
     serial = emulator.running_serial()
@@ -1065,21 +1085,12 @@ def cmd_corpus(args) -> int:
 
     if args.corpus_action == "index":
         dest = Path(args.out)
-        dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists() and not args.force:
             _emit({"index": str(dest), "cached": True})
             return 0
-        import urllib.request, urllib.error
-        try:
-            with urllib.request.urlopen(androzoo.INDEX_URL, timeout=args.timeout) as resp:
-                with dest.open("wb") as fh:
-                    while True:
-                        chunk = resp.read(1 << 22)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            _emit({"error": f"index download failed: {exc}"})
+        downloaded, error = androzoo.download_index(dest, timeout=args.timeout)
+        if downloaded is None:
+            _emit({"error": f"index download failed: {error}"})
             return 1
         _emit({"index": str(dest), "bytes": dest.stat().st_size})
         return 0

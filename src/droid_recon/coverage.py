@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, field
 
 from .models import utcnow
 
-
 STATUSES = ("tested", "skipped", "unsupported", "failed")
 RESULT_STATES = (
     "STATIC_CANDIDATE", "OBSERVED", "CONFIRMED", "INCONCLUSIVE",

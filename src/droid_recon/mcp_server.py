@@ -25,22 +25,44 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from . import apk_identity, evidence, report as report_mod
+from . import __version__, apk_identity, evidence
 from . import chains as chains_mod
+from . import report as report_mod
 from . import triage as triage_mod
-from .device import (certs, emulator, exploit, explorer, install, network, oracle, ordinary,
-                     payloads, probes, screen, storage)
+from .device import (
+    certs,
+    emulator,
+    exploit,
+    explorer,
+    install,
+    network,
+    ordinary,
+    payloads,
+    probes,
+    screen,
+    storage,
+)
+from .device_agent.deploy import ensure_agent as _ensure_agent
 from .frida import native as native_mod
 from .frida import server as frida_server
 from .models import Component
 from .permissions import READ_ONLY
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, flows, ghidra, intents, lottie, manifest, resources, sweep, urimatcher
+from .static import (
+    decompile,
+    flows,
+    ghidra,
+    intents,
+    lottie,
+    manifest,
+    resources,
+    sweep,
+    urimatcher,
+)
 from .transport import DeviceAgentConfig, FridaTransportConfig
-from .device_agent.deploy import ensure_agent as _ensure_agent
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "droid-recon", "version": "0.3.0"}
+SERVER_INFO = {"name": "droid-recon", "version": __version__}
 
 _SESSIONS_ROOT = Path(DEFAULT_ROOT)
 MCP_MUTATION_ENV = "DROID_RECON_MCP_ALLOW_MUTATIONS"
@@ -412,23 +434,29 @@ def _probe_ipc(args: dict) -> dict:
             for auth in comp.authorities:
                 paths = known.get(auth) or (floating[:4] + list(urimatcher.FALLBACK_PATHS[:8]))
                 for p in paths[:14]:
-                    sess.add_observation(probes.query_provider(ctx, comp, auth, p)); made += 1
+                    sess.add_observation(probes.query_provider(ctx, comp, auth, p))
+                    made += 1
                 for m in (pp.get("call_methods") or [])[:6]:
-                    sess.add_observation(probes.call_provider(ctx, comp, auth, m)); made += 1
+                    sess.add_observation(probes.call_provider(ctx, comp, auth, m))
+                    made += 1
                 if args.get("traversal"):
                     for t in urimatcher.TRAVERSAL_PATHS:
                         sess.add_observation(probes.read_provider_file(ctx, comp, auth, t))
                         made += 1
         elif comp.type in ("activity", "activity-alias"):
-            sess.add_observation(probes.launch_activity(ctx, comp)); made += 1
+            sess.add_observation(probes.launch_activity(ctx, comp))
+            made += 1
             for uri in comp.deeplinks()[:5]:
-                sess.add_observation(probes.launch_deeplink(ctx, comp, uri)); made += 1
+                sess.add_observation(probes.launch_deeplink(ctx, comp, uri))
+                made += 1
         elif comp.type == "receiver":
             for f in comp.intent_filters:
                 for a in f.actions[:4]:
-                    sess.add_observation(probes.send_broadcast(ctx, comp, a)); made += 1
+                    sess.add_observation(probes.send_broadcast(ctx, comp, a))
+                    made += 1
         elif comp.type == "service":
-            sess.add_observation(probes.start_service(ctx, comp)); made += 1
+            sess.add_observation(probes.start_service(ctx, comp))
+            made += 1
         observed = sess.observations()[before_count:]
         if observed:
             probed += 1

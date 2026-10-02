@@ -7,7 +7,6 @@ import pytest
 from droid_recon.models import AttackSurface, Component
 from droid_recon.static import flows
 
-
 CORPUS = Path(__file__).parent / "benchmark"
 CASES = (
     ("webview_unguarded", True, "WebView.loadUrl"),

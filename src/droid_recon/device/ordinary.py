@@ -13,7 +13,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -25,7 +27,7 @@ from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 from .. import shell
-from ..models import Component
+from ..models import Component, ComponentType
 
 COMPANION_PACKAGE = "org.droidrecon.companion"
 COMPANION_ACTIVITY = f"{COMPANION_PACKAGE}/.ProbeActivity"
@@ -35,10 +37,9 @@ _SOURCE_PROJECT = Path(__file__).resolve().parents[3] / "android" / "companion"
 _PACKAGED_PROJECT = Path(__file__).resolve().parents[1] / "assets" / "companion"
 DEFAULT_PROJECT = (_PACKAGED_PROJECT if (_PACKAGED_PROJECT / "settings.gradle").is_file()
                    else _SOURCE_PROJECT)
-DEFAULT_BUILD_ROOT = (
-    _SOURCE_PROJECT.parents[2] / "companion-build"
-    if DEFAULT_PROJECT == _SOURCE_PROJECT and (_SOURCE_PROJECT / "settings.gradle").is_file()
-    else Path(tempfile.gettempdir()) / "droid-recon" / "companion-build"
+DEFAULT_BUILD_ROOT = Path(
+    os.environ.get("DROID_RECON_COMPANION_BUILD")
+    or Path.home() / ".cache" / "droid-recon" / "companion-build"
 )
 OPERATIONS = {"activity", "deeplink", "service", "broadcast", "provider_query",
               "provider_call"}
@@ -60,6 +61,13 @@ _TRUSTED_SOURCE_BUILD_SHA256S: set[str] = set()
 
 Operation = Literal["activity", "deeplink", "service", "broadcast", "provider_query",
                     "provider_call"]
+_DEFAULT_OPERATION: dict[ComponentType, Operation] = {
+    "activity": "activity",
+    "activity-alias": "activity",
+    "service": "service",
+    "receiver": "broadcast",
+    "provider": "provider_query",
+}
 
 
 @dataclass(frozen=True)
@@ -161,10 +169,7 @@ def request_for_component(
     a target-defined call method may have side effects.
     """
     if operation is None:
-        operation = {
-            "activity": "activity", "activity-alias": "activity",
-            "service": "service", "receiver": "broadcast", "provider": "provider_query",
-        }[component.type]
+        operation = _DEFAULT_OPERATION[component.type]
     if operation in {"provider_query", "provider_call"} and component.type != "provider":
         raise ValueError("provider probes require a provider component")
     if operation in {"provider_query", "provider_call"} and uri is None:
@@ -244,17 +249,40 @@ def build_companion(project: Path = DEFAULT_PROJECT, *, gradle: str | None = Non
     project = Path(project)
     if not (project / "settings.gradle").is_file():
         return CompanionBuild("unavailable", message=f"companion source not found: {project}")
+    build_root = Path(build_root)
     tool = gradle or shell.which("gradle")
+    gradle_failure: str | None = None
     if tool:
-        proc = shell.run([tool, ":app:assembleDebug", "--no-daemon"],
-                         timeout=timeout, cwd=project)
-        apk = project / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
-        if proc.ok and apk.is_file():
-            _remember_source_build(apk, project)
-            return CompanionBuild("built", apk=apk, message="companion APK built with Gradle")
-    built = _build_with_sdk(project, Path(build_root), timeout=timeout)
+        build_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="gradle-project-", dir=build_root) as temp_dir:
+            isolated_project = Path(temp_dir) / "project"
+            shutil.copytree(
+                project,
+                isolated_project,
+                ignore=shutil.ignore_patterns(".gradle", "build", ".idea", "local.properties"),
+            )
+            proc = shell.run(
+                [tool, ":app:assembleDebug", "--no-daemon"],
+                timeout=timeout,
+                cwd=isolated_project,
+            )
+            generated = (isolated_project / "app" / "build" / "outputs" / "apk"
+                         / "debug" / "app-debug.apk")
+            if proc.ok and generated.is_file():
+                output = build_root / "droid-recon-companion.apk"
+                shutil.copy2(generated, output)
+                _remember_source_build(output, project)
+                return CompanionBuild(
+                    "built", apk=output,
+                    message="companion APK built with Gradle in an isolated directory",
+                )
+            gradle_failure = (proc.stderr or proc.stdout)[-1200:] or "Gradle produced no APK"
+
+    built = _build_with_sdk(project, build_root, timeout=timeout)
     if built.status == "built" and built.apk is not None:
         _remember_source_build(built.apk, project)
+    elif gradle_failure:
+        built.message = f"Gradle failed: {gradle_failure}; SDK fallback: {built.message}"
     return built
 
 
@@ -375,6 +403,22 @@ def install_companion(apk: Path, serial: str | None = None) -> CompanionInstall:
                                 _TRUSTED_SOURCE_BUILD_SHA256S)
     proc = shell.adb("install", "-r", str(apk), serial=serial, timeout=120)
     message = (proc.stdout + proc.stderr).strip()[-1200:]
+    replaced_stale_build = False
+    if (verified_build and "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in message):
+        # The companion is disposable tool infrastructure. A previous source build may
+        # have used a different local debug key, so replace only when the incoming APK
+        # is a build whose exact digest this process trusts.
+        removed = shell.adb("uninstall", COMPANION_PACKAGE, serial=serial, timeout=120)
+        removed_message = (removed.stdout + removed.stderr).strip()
+        if not removed.ok or "Success" not in removed_message:
+            return CompanionInstall(
+                "failed",
+                f"signature mismatch and stale companion removal failed: {removed_message}",
+                serial,
+            )
+        proc = shell.adb("install", str(apk), serial=serial, timeout=120)
+        message = (proc.stdout + proc.stderr).strip()[-1200:]
+        replaced_stale_build = True
     if not proc.ok or "Success" not in message:
         return CompanionInstall("failed", message or f"adb install rc={proc.rc}", serial)
     check = shell.adb_shell(["pm", "path", COMPANION_PACKAGE], serial=serial, timeout=15)
@@ -383,6 +427,7 @@ def install_companion(apk: Path, serial: str | None = None) -> CompanionInstall:
     return CompanionInstall(
         "installed",
         ("verified companion build installed without requested permissions"
+         + (" (replaced stale local signing identity)" if replaced_stale_build else "")
          if verified_build else
          "custom companion installed without requested permissions; source unverified"),
         serial, verified_build=verified_build,

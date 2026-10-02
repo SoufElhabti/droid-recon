@@ -386,7 +386,8 @@ def _interpret(blob: dict) -> dict:
     dangerous = [{"symbol": i, "why": _DANGEROUS_IMPORTS[i]}
                  for i in imports if i in _DANGEROUS_IMPORTS]
 
-    secrets, endpoints = [], []
+    secrets: list[dict] = []
+    endpoints: list[dict] = []
     for s in blob.get("strings", []):
         val = s.get("value", "")
         for rx, label in _SECRET_RE:

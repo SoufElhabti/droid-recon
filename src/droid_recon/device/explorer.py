@@ -26,7 +26,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import shell
 from ..log import ok, say, warn
 from . import screen
 

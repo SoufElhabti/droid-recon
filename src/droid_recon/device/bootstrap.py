@@ -19,7 +19,6 @@ The boundary:
 from __future__ import annotations
 
 from .. import shell
-from ..log import say
 
 
 def launch_app(package: str, serial: str | None = None, *, agent=None) -> None:

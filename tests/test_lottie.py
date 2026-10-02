@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import zipfile
+from pathlib import Path
 
 from droid_recon.static import lottie
 

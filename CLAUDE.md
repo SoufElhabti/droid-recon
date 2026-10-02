@@ -1,6 +1,6 @@
 # droid-recon operator and orchestrator guide
 
-This is the operational contract for the **0.3.0 development snapshot**. `prompt.md` records the original vision; use the implemented commands and evidence rules here when the two differ. The new snapshot passes the Python tests but has **not** been validated end-to-end on a live emulator. Device-specific claims from the original author's lab are labeled as historical below; they are not measurements from this Windows workspace.
+This is the operational contract for the **0.4.0.dev1 development candidate**. `prompt.md` records the original vision; use the implemented commands and evidence rules here when the two differ. Device-specific claims from earlier developer-owned lab runs are labeled as historical below and must not be generalized to another target or Android build.
 
 Use the tool only on applications and devices you own or are authorized to assess. See [GUIDE.md](GUIDE.md) for installation and the command walkthrough, and [docs/release-notes.md](docs/release-notes.md) for changes and limits.
 
@@ -98,7 +98,7 @@ The source-to-sink fixture benchmark has eight tiny Java examples (four vulnerab
 
 ## Historical lessons from the original author's lab
 
-The following measurements and false-positive examples came from the original author's developer-owned Android lab and earlier droid-recon versions. They were **not** rerun on this Windows host or with the 0.3.0 snapshot. The [WebView lab report](docs/example-report-webviewlab.md) is a historical example whose underlying device evidence bundle is not included here.
+The following measurements and false-positive examples came from developer-owned Android lab runs and earlier droid-recon versions. They were **not** rerun for every 0.4.0.dev1 change. The [WebView lab report](docs/example-report-webviewlab.md) is a historical example whose underlying device evidence bundle is not included here.
 
 - On that lab's Android 14 image, a live Conscrypt APEX trust-store overlay required correct file labels and app mount namespaces. The earlier run reported 135 certificates after adding the test CA and a captured app HTTPS request. These counts and steps depend on the image; they are not current host prerequisites or validation.
 - The earlier lab measured about 2.7 seconds for static manifest work, about 15 seconds for JADX on an 18 MB APK, and about 23 seconds for a headless emulator boot. Do not use these as runtime promises.

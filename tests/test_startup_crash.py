@@ -7,7 +7,6 @@ from droid_recon.models import Observation
 from droid_recon.static.manifest import parse_manifest
 from droid_recon.triage import triage
 
-
 PACKAGE = "com.watchguard.authpoint"
 ACTIVITY = "androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity"
 RECEIVER = "com.google.firebase.iid.FirebaseInstanceIdReceiver"
