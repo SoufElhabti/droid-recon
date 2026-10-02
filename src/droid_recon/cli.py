@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from .device import (bootstrap, certs, emulator, exploit, explorer, install, net
 from .log import die, ok, say, warn
 from .models import SessionState
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, flows, ghidra, intents, manifest, resources, sweep, urimatcher
+from .static import decompile, flows, ghidra, intents, lottie, manifest, resources, sweep, urimatcher
 from . import chains as chains_mod
 from .transport import FridaTransportConfig, TransportConfig
 from .device_agent.deploy import ensure_agent
@@ -148,6 +149,7 @@ def cmd_code(args) -> int:
     authorities = sorted({a for c in surface.components for a in c.authorities})
     code.provider_paths = urimatcher.extract(tree, authorities)
     intent_extras = intents.extract(tree, [c.name for c in surface.components])
+    code.lottie = lottie.analyze(tree, apks)
 
     doc = code.to_dict()
     doc["apk_sha256"] = surface.apk_sha256
@@ -183,6 +185,7 @@ def cmd_code(args) -> int:
             "components": len(intent_extras["by_component"]),
             "unique_keys": len(intent_extras["global_keys"]),
         },
+        "lottie": lottie.brief(code.lottie),
         "focused": doc["focused"],
         "artifact": str(session.code_path),
     })
@@ -845,7 +848,15 @@ def cmd_frida(args) -> int:
             args.package, script, serial, spawn=not args.attach, duration=args.duration,
             transport=tc.frida,
         )
-        _emit({"ok": succeeded, "script": str(script), "output": output})
+        session = Session.open(args.package, Path(args.sessions))
+        artifact = frida_server.persist_output(
+            output, session.dir / "frida", script.stem)
+        _emit({
+            "ok": succeeded,
+            "script": str(script),
+            "output": frida_server.output_excerpt(output, 8000),
+            "artifact": str(artifact) if artifact else None,
+        })
         return 0 if succeeded else 7
 
     return 1
@@ -1044,6 +1055,94 @@ def cmd_ui(args) -> int:
 
 # ---- native ----
 
+def cmd_corpus(args) -> int:
+    """Acquire APKs from an operator-configured corpus.
+
+    Kept separate from analysis on purpose: every source has its own terms, and
+    the key is always supplied by the operator rather than embedded.
+    """
+    from .corpus import androzoo
+
+    if args.corpus_action == "index":
+        dest = Path(args.out)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and not args.force:
+            _emit({"index": str(dest), "cached": True})
+            return 0
+        import urllib.request, urllib.error
+        try:
+            with urllib.request.urlopen(androzoo.INDEX_URL, timeout=args.timeout) as resp:
+                with dest.open("wb") as fh:
+                    while True:
+                        chunk = resp.read(1 << 22)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            _emit({"error": f"index download failed: {exc}"})
+            return 1
+        _emit({"index": str(dest), "bytes": dest.stat().st_size})
+        return 0
+
+    if args.corpus_action == "fetch":
+        key = args.key or os.environ.get("ANDROZOO_API_KEY")
+        if not key:
+            _emit({"error": "no API key — pass --key or set ANDROZOO_API_KEY"})
+            return 2
+        packages = list(args.package or [])
+        if args.packages_file:
+            packages += [ln.strip() for ln in Path(args.packages_file).read_text().splitlines()
+                         if ln.strip() and not ln.startswith("#")]
+        if not packages:
+            _emit({"error": "no packages — pass --package or --packages-file"})
+            return 2
+        index = Path(args.index)
+        if not index.is_file():
+            _emit({"error": f"index not found: {index} (run `corpus index` first)"})
+            return 2
+        _emit(androzoo.fetch_packages(index, packages, key, Path(args.out)))
+        return 0
+    return 2
+
+
+def cmd_lottie(args) -> int:
+    """Batch-triage a corpus for the exploitable Lottie stack.
+
+    Deliberately archive-only: no jadx, no device.  The point is to spend
+    seconds per APK deciding which targets deserve a full `code` run.
+    """
+    from .static import lottie as lottie_mod
+
+    targets: dict[str, list[Path]] = {}
+    if args.installed:
+        serial = _pick_serial(args)
+        from .device import install as install_mod
+        pulled = Path(args.out)
+        pulled.mkdir(parents=True, exist_ok=True)
+        for pkg in install_mod.list_packages(serial, third_party_only=True):
+            dest = pulled / pkg
+            dest.mkdir(parents=True, exist_ok=True)
+            local = install_mod.pull_installed_apk(pkg, dest, serial)
+            if local:
+                targets[pkg] = local
+    for raw in args.target or []:
+        path = Path(raw)
+        if path.is_dir():
+            apks = sorted(path.glob("*.apk"))
+            if apks:
+                targets[path.name] = apks
+        elif path.is_file():
+            targets[path.name] = [path]
+
+    if not targets:
+        _emit({"error": "no targets — pass APK paths/directories or --installed"})
+        return 2
+
+    result = lottie_mod.scan_many(targets)
+    _emit(result)
+    return 0
+
+
 def cmd_native(args) -> int:
     serial = _pick_serial(args)
     session = Session.open(args.package, Path(args.sessions))
@@ -1188,7 +1287,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_static)
 
     # code
-    sp = sub.add_parser("code", help="jadx decompile + sink/source sweep + provider paths")
+    sp = sub.add_parser(
+        "code", help="jadx sweep + provider paths + Lottie fingerprint (Q1-Q10)")
     add_target(sp)
     sp.add_argument("--force", action="store_true", help="ignore the jadx cache")
     sp.add_argument("--timeout", type=int, default=decompile.JADX_TIMEOUT)
@@ -1304,7 +1404,8 @@ def build_parser() -> argparse.ArgumentParser:
     fr = fsub.add_parser("run", help="run a script against a package")
     fr.add_argument("package")
     fr.add_argument("--script", default="ssl_unpin",
-                    help="built-in name (ssl_unpin, crypto_logger, webview_hooks) or a path")
+                    help="built-in name (ssl_unpin, crypto_logger, webview_hooks, "
+                         "lottie_tracer) or a path")
     fr.add_argument("--attach", action="store_true", help="attach instead of spawn")
     fr.add_argument("--duration", type=int, default=25, help="collection window in seconds")
     sp.add_argument("--serial", default=None)
@@ -1366,6 +1467,32 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("package")
     sp.add_argument("--serial", default=None)
     sp.set_defaults(func=cmd_ui)
+
+    # corpus
+    sp = sub.add_parser("corpus", help="acquire APKs from an operator-configured corpus")
+    csub = sp.add_subparsers(dest="corpus_action", required=True)
+    ci = csub.add_parser("index", help="download the AndroZoo index (multi-GB, cached)")
+    ci.add_argument("--out", default="./androzoo-latest.csv.gz")
+    ci.add_argument("--force", action="store_true")
+    ci.add_argument("--timeout", type=int, default=3600)
+    cf = csub.add_parser("fetch", help="resolve package names and download, hash-verified")
+    cf.add_argument("--index", default="./androzoo-latest.csv.gz")
+    cf.add_argument("--key", default=None, help="AndroZoo API key (or $ANDROZOO_API_KEY)")
+    cf.add_argument("--package", action="append", help="repeatable")
+    cf.add_argument("--packages-file", default=None, help="one package name per line")
+    cf.add_argument("--out", default="./apk-corpus")
+    sp.set_defaults(func=cmd_corpus)
+
+    # lottie
+    sp = sub.add_parser("lottie", help="batch-triage APKs for the exploitable Lottie stack")
+    lsub = sp.add_subparsers(dest="lottie_action", required=True)
+    ls = lsub.add_parser("scan", help="fingerprint a corpus, ranked by exploitability")
+    ls.add_argument("target", nargs="*", help="APK files or directories of APKs")
+    ls.add_argument("--installed", action="store_true",
+                    help="pull and scan every third-party package on the device")
+    ls.add_argument("--out", default="./apk-corpus", help="where --installed pulls to")
+    ls.add_argument("--serial", default=None)
+    sp.set_defaults(func=cmd_lottie)
 
     # native
     sp = sub.add_parser("native", help="native/JNI tracing via Frida")

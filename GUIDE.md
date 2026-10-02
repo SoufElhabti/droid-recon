@@ -33,6 +33,24 @@ droid-recon code ./targets/app-splits/
 
 The code report also includes source-to-sink **candidates** for exported components. Each candidate points to source and sink lines and lists nearby checks such as URI host comparisons or permission calls. This is a same-method, lexical Java analysis of JADX output. It does not trace arbitrary calls, fields, callbacks, Kotlin, reflection, or native code; it does not decide whether nearby validation is effective. Every such result remains `STATIC_CANDIDATE` until separately tested.
 
+The same `code` pass fingerprints Lottie stacks with Q1-Q10 evidence. It recognizes obfuscated lottie-android builds from stable parser strings, Lottie Web assets, renamed rlottie libraries, and dotLottie-native/ThorVG expression builds. Stack presence and attacker-influenced delivery are reported separately: finding a library is not proof that an attacker can supply animation content or trigger an exploitable path.
+
+### Corpus and Lottie triage
+
+Corpus acquisition is deliberately separate from analysis. droid-recon ships no APKs or API keys; operators must comply with the selected corpus's access terms.
+
+```text
+export ANDROZOO_API_KEY=...
+droid-recon corpus index --out ./androzoo-latest.csv.gz
+droid-recon corpus fetch --index ./androzoo-latest.csv.gz \
+  --packages-file ./targets.txt --out ./apk-corpus
+droid-recon lottie scan ./apk-corpus
+```
+
+Downloads are streamed with a size cap and verified against the index SHA-256; a mismatch is deleted. The index is a research snapshot, so reacquire a candidate from an authorized current source before making version-specific or live-impact claims.
+
+`lottie scan` is archive-only: it neither executes APK content nor runs JADX. It ranks structural candidates so an operator can select targets for `code` and runtime confirmation. The highest structural verdict requires the dotLottie native player, ThorVG expression markers, and the relevant base64 write sink in the same ELF. Even that verdict remains a candidate until an authorized runtime test proves attacker-controlled delivery and effect.
+
 ## 3. Test on a device
 
 For a device you control, attach it with ADB or start a configured AVD:
@@ -115,12 +133,15 @@ The existing `net`, `frida`, `native`, `ghidra`, `ui`, and `chains` commands rem
 ```text
 droid-recon net status
 droid-recon net capture com.example.app --duration 30
+droid-recon frida run com.example.app --script lottie_tracer
 droid-recon native libs com.example.app
 droid-recon ui state com.example.app
 droid-recon chains com.example.app
 ```
 
 Use each command's `--help` for its current options. A normal `audit` does not run network interception or native analysis automatically. An MCP client can start `droid-recon mcp` as a stdio server by pointing its server configuration at the installed executable and passing `mcp` as the argument. The server exposes only read-only tools by default and blocks a device-changing call even if a client requests it. An operator who wants those tools in MCP must start `droid-recon mcp --allow-mutating-tools` or set `DROID_RECON_MCP_ALLOW_MUTATIONS=1`. The client's own permission policy can add another gate.
+
+The built-in `lottie_tracer` observes composition factory and native player entry points, records bounded and redacted argument previews, and preserves the complete transcript under the package session. It does not consume input streams or claim exploitability from a hook alone.
 
 An optional interactive model can drive the tool interface:
 
@@ -141,5 +162,6 @@ The agent bounds tool output and redacts common secret fields and credential pat
 - Split APK support merges declared components and code inputs. It does not reconstruct every Play delivery or runtime feature-install condition.
 - Ordinary UID checks distinguish accepted, denied, and inconclusive cases. They do not prove a vulnerability, and the companion may be unavailable without Android build tools or a supplied APK.
 - `diff` reports packaged binary changes but cannot name exact third-party dependencies or their versions.
+- Lottie fingerprints are structural heuristics. Obfuscation, custom forks, dynamic loading, and multi-method delivery paths can create false negatives or candidates requiring manual review.
 - UI exploration is heuristic and may miss authenticated, gesture-heavy, CAPTCHA, biometric, or WebView-rendered flows.
 - The [WebView lab report](docs/example-report-webviewlab.md) is a historical example from an earlier developer-owned run. Its device evidence was not reproduced for this version.

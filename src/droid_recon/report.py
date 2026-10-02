@@ -41,6 +41,7 @@ def build(session: Session, *, top_n: int = TOP_N) -> dict:
             "dead_ends": str(session.dead_ends_path),
             "screenshots": str(session.screenshots),
             "storage": str(session.storage),
+            "frida": str(session.dir / "frida"),
             "log": str(session.log_path),
         },
     }
@@ -428,6 +429,15 @@ def to_markdown(doc: dict) -> str:
             a(f"- **Secret-shaped literals: {cs['secrets']}**")
         if cs.get("local_servers"):
             a(f"- Local servers: {cs['local_servers']}")
+        lottie_stacks = cs.get("lottie_stacks") or []
+        if lottie_stacks:
+            a(f"- Lottie stacks: {', '.join(f'`{name}`' for name in lottie_stacks)}")
+            if cs.get("lottie_attacker_influenced_delivery"):
+                a("- **Attacker-influenced Lottie delivery candidate: yes** "
+                  "(runtime confirmation required)")
+            else:
+                a("- Attacker-influenced Lottie delivery candidate: not found by the "
+                  "bounded static pass")
         a("")
 
     focused = doc.get("code_focused", {})

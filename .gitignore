@@ -35,3 +35,7 @@ test-glide/
 apk-corpus/
 state.json
 .claude/
+
+# Per-machine MCP registration: the interpreter path differs per host.
+# Copy .mcp.json.example and adjust if your client needs an absolute path.
+.mcp.json

@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 
 from .. import shell
-from ..log import say, warn
+from ..log import say
 
 # ---- generated Frida scripts ----
 
@@ -216,10 +216,17 @@ def trace(package: str, mode: str = "jni", *, serial: str | None = None,
     good, output = frida_server.run_script(package, script_path, serial,
                                            spawn=spawn, duration=duration,
                                            transport=transport)
+    raw_path = frida_server.persist_output(output, work, f"native-{mode}")
     if not good:
-        return False, {"error": output[:600], "mode": mode}
+        return False, {
+            "error": frida_server.output_excerpt(output, 600),
+            "mode": mode,
+            "raw_artifact": str(raw_path) if raw_path else None,
+        }
 
-    return True, _parse(mode, output)
+    parsed = _parse(mode, output)
+    parsed["raw_artifact"] = str(raw_path) if raw_path else None
+    return True, parsed
 
 
 def _parse(mode: str, output: str) -> dict:
