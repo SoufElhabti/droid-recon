@@ -17,8 +17,10 @@ emitted as a *candidate* for the orchestrator to adjudicate, not written to find
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
+from .device import logcat
 from .models import AttackSurface, Component, Finding, Observation, Severity
 
 # Effects that mean something actually happened.
@@ -56,6 +58,15 @@ def _uri_from_command(obs: Observation) -> str | None:
 
 def _reject(obs: Observation, why: str) -> dict:
     return {"observation": obs.id, "kind": obs.kind, "component": obs.component, "why": why}
+
+
+def _candidate(obs: Observation, why: str) -> dict:
+    return {
+        "observation": obs.id, "kind": obs.kind, "component": obs.component,
+        "reachable_from": obs.reachable_from, "signal": obs.signal,
+        "why_candidate": why, "command": obs.command,
+        "stdout_excerpt": obs.stdout_excerpt[:300],
+    }
 
 
 def _severity_for(obs: Observation, comp: Component | None) -> Severity:
@@ -98,7 +109,7 @@ def _story(obs: Observation, comp: Component | None) -> tuple[dict, dict, list[s
             "code_excerpt": obs.stdout_excerpt[:300],
         }
         chain = [
-            f"Attacker app declares no special permission"
+            "Attacker app declares no special permission"
             + (f" (or holds {guard}, protection level allows it)" if guard else ""),
             f"Attacker calls ContentResolver.query(Uri.parse(\"{uri}\"))",
             f"Provider {cname} is exported with no effective read guard",
@@ -129,7 +140,7 @@ def _story(obs: Observation, comp: Component | None) -> tuple[dict, dict, list[s
 
     if obs.signal == "crash" and obs.reachable_from in ("third_party_app", "browser"):
         source = {
-            "type": "malformed/unexpected Intent from an unprivileged caller",
+            "type": "component invocation through an exported entry point",
             "name": obs.kind,
             "code_location": cname,
             "code_excerpt": " ".join(obs.command),
@@ -141,9 +152,9 @@ def _story(obs: Observation, comp: Component | None) -> tuple[dict, dict, list[s
             "code_excerpt": obs.logcat_excerpt[:300],
         }
         chain = [
-            f"Attacker app sends an Intent to exported {cname}",
-            "Component dereferences attacker-controlled extras without validation",
-            "Process crashes — denial of service, and an input-validation gap worth deeper review",
+            f"Manifest marks {cname} as reachable by an ordinary caller",
+            f"Shell probe invokes {cname}; the fatal stack names this component",
+            "The target process crashes; an ordinary-app reproduction is needed to confirm impact",
         ]
         return source, sink, chain
 
@@ -205,6 +216,30 @@ def triage(surface: AttackSurface, observations: list[Observation],
             ))
             continue
 
+        if obs.signal == "crash":
+            origin = obs.detail.get("crash_origin") or logcat.crash_origin(
+                obs.logcat_excerpt, obs.package,
+                comp.target_activity or comp.name if comp else obs.component,
+            )
+            if origin == "app_initialization":
+                rejected.append(_reject(
+                    obs, "app initialization crashed before the requested component "
+                    "executed; this observation does not establish a component defect",
+                ))
+                continue
+            if origin != "target_component":
+                candidates.append(_candidate(
+                    obs, "a process crash was observed, but the fatal stack does not "
+                    "identify the requested component; attribution is inconclusive",
+                ))
+                continue
+            if comp and comp.permission and not obs.detail.get("ordinary_caller_verified"):
+                candidates.append(_candidate(
+                    obs, f"{comp.name} requires {comp.permission}; an adb shell probe "
+                    "does not demonstrate access from an ordinary app UID",
+                ))
+                continue
+
         # Gate 2 — a real effect.
         if obs.signal not in _MEANINGFUL and not obs.detail.get("logcat_sensitive_tokens"):
             rejected.append(_reject(obs, f"signal={obs.signal!r}: no observable effect"))
@@ -213,17 +248,10 @@ def triage(surface: AttackSurface, observations: list[Observation],
         # Gate 3 — a source -> sink -> chain story.
         story = _story(obs, comp)
         if story is None:
-            candidates.append({
-                "observation": obs.id,
-                "kind": obs.kind,
-                "component": obs.component,
-                "reachable_from": obs.reachable_from,
-                "signal": obs.signal,
-                "why_candidate": "reachable and produced an effect, but no source->sink->chain "
-                                 "could be stated automatically — needs manual adjudication",
-                "command": obs.command,
-                "stdout_excerpt": obs.stdout_excerpt[:300],
-            })
+            candidates.append(_candidate(
+                obs, "reachable and produced an effect, but no source->sink->chain "
+                "could be stated automatically — needs manual adjudication",
+            ))
             continue
 
         source, sink, chain = story
@@ -269,11 +297,16 @@ def triage(surface: AttackSurface, observations: list[Observation],
             },
             observations=[obs.id],
             cwe=_cwe(obs),
-            notes="Reachability is derived from the manifest, not from the probe's exit code. "
-                  "The probe ran as the shell UID; the manifest is what establishes that an "
-                  "unprivileged third-party app can do the same."
+            notes="Reachability is inferred from the manifest, not from the probe's exit code. "
+                  "The probe ran as the shell UID. Confirm the same effect from an ordinary "
+                  "app UID before treating this as a demonstrated third-party exploit."
                   + (f"\n\nPLATFORM COMPONENT: {_PLATFORM_NOTE}" if platform else ""),
         )
+        stable_key = "|".join((surface.package, obs.component or "", obs.kind,
+                               obs.signal, str(sink)))
+        finding.evidence["stable_id"] = "DR-" + hashlib.sha256(
+            stable_key.encode("utf-8")
+        ).hexdigest()[:12]
         if platform:
             finding.severity = _downgrade(finding.severity)
             finding.evidence["platform_by_design_caveat"] = True
@@ -296,7 +329,7 @@ def _title(obs: Observation, comp: Component | None) -> str:
     if obs.detail.get("logcat_sensitive_tokens"):
         return f"Credential-shaped material logged when {name} is triggered by an unprivileged app"
     if obs.signal == "crash":
-        return f"Exported {comp.type if comp else 'component'} {name} crashes on attacker-controlled Intent"
+        return f"Exported {comp.type if comp else 'component'} {name} crashes during component invocation"
     return f"{name}: {obs.signal}"
 
 
@@ -333,6 +366,6 @@ def _impact(obs: Observation, comp: Component | None) -> str:
         return ("Credential-shaped values reach the system log, where they are readable by "
                 "diagnostic tooling and by any process holding READ_LOGS.")
     if obs.signal == "crash":
-        return (f"Any app can crash {obs.component} on demand (denial of service), and the "
-                f"unvalidated input path may be exploitable beyond a crash.")
+        return (f"A shell probe triggered a crash in {obs.component}. The exported manifest "
+                "entry suggests ordinary-app reachability, which needs separate reproduction.")
     return "See chain."

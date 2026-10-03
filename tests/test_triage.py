@@ -110,7 +110,8 @@ def test_crash_on_exported_component_is_low_severity(surface):
         kind="launch_activity",
         component="com.example.target.ExportedNoGuardActivity",
         signal="crash",
-        logcat_excerpt="FATAL EXCEPTION: main\njava.lang.NullPointerException",
+        logcat_excerpt=("FATAL EXCEPTION: main\njava.lang.NullPointerException\n"
+                        "at com.example.target.ExportedNoGuardActivity.onCreate(A.java:42)"),
     )])
     assert len(result.findings) == 1
     assert result.findings[0].severity == "low"

@@ -42,6 +42,7 @@ class CodeReport:
     local_servers: list[Hit] = field(default_factory=list)
     secrets: list[Hit] = field(default_factory=list)
     provider_paths: dict = field(default_factory=dict)
+    lottie: dict = field(default_factory=dict)
     files_scanned: int = 0
 
     def app_only(self, hits: list[Hit]) -> list[Hit]:
@@ -55,6 +56,7 @@ class CodeReport:
             "local_servers": [h.to_dict() for h in self.local_servers],
             "secrets": [h.to_dict() for h in self.secrets],
             "provider_paths": self.provider_paths,
+            "lottie": self.lottie,
             "summary": self.summary(),
         }
 
@@ -68,6 +70,10 @@ class CodeReport:
             "local_servers": len(self.local_servers),
             "secrets": len(self.secrets),
             "provider_authorities_with_paths": len(self.provider_paths.get("paths", {})),
+            "lottie_stacks": (self.lottie.get("summary") or {}).get("stacks_present", []),
+            "lottie_attacker_influenced_delivery": bool(
+                (self.lottie.get("summary") or {}).get("attacker_influenced_delivery")
+            ),
         }
 
 
@@ -95,10 +101,11 @@ def sweep(tree: Path, surface: AttackSurface, *, context_chars: int = 60,
     label_counts: dict[str, int] = {}
 
     for java in tree.rglob("*.java"):
-        rel = str(java.relative_to(tree))
+        # jadx paths in reports use '/' on every host so component hints match on Windows.
+        rel = java.relative_to(tree).as_posix()
         is_lib = P.is_library_path(rel)
         try:
-            content = java.read_text(errors="ignore")
+            content = java.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         report.files_scanned += 1
@@ -166,6 +173,10 @@ def verdict(surface: AttackSurface, report: CodeReport | None = None) -> str:
         signals.append("SEND target")
     if s["has_grant_uri"]:
         signals.append("grantUriPermissions")
+    if s["providers_write_reachable"]:
+        signals.append(f"{s['providers_write_reachable']} writable provider(s)")
+    if s["providers_call_reachable"]:
+        signals.append(f"{s['providers_call_reachable']} callable provider(s)")
     if s["permission_misconfigs"]:
         signals.append(f"{s['permission_misconfigs']} perm misconfigs")
     if s["debuggable"]:

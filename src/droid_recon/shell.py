@@ -76,8 +76,14 @@ def android_home() -> Path | None:
         if val and Path(val).is_dir():
             return Path(val)
     for guess in (
+        # Linux
+        Path.home() / "Android/Sdk",              # Android Studio default
+        Path("/usr/lib/android-sdk"),             # Debian/Ubuntu package
+        Path("/opt/android-sdk"),                 # Arch and most manual installs
+        # macOS
         Path("/opt/homebrew/share/android-commandlinetools"),
         Path.home() / "Library/Android/sdk",
+        Path.home() / "AppData/Local/Android/Sdk",
     ):
         if guess.is_dir():
             return guess
@@ -90,9 +96,17 @@ def _sdk_tool(*relative: str) -> str | None:
         return None
     for rel in relative:
         cand = home / rel
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
+        for option in _executable_candidates(cand):
+            if option.is_file() and os.access(option, os.X_OK):
+                return str(option)
     return None
+
+
+def _executable_candidates(path: Path) -> tuple[Path, ...]:
+    """Include Windows SDK wrappers without changing Unix lookup behavior."""
+    if os.name == "nt" and not path.suffix:
+        return (path, *(path.with_suffix(ext) for ext in (".exe", ".bat", ".cmd")))
+    return (path,)
 
 
 def which(name: str, *sdk_relative: str) -> str | None:
@@ -109,8 +123,9 @@ def which(name: str, *sdk_relative: str) -> str | None:
 
     interpreter_bin = Path(sys.executable).parent
     cand = interpreter_bin / name
-    if cand.is_file() and os.access(cand, os.X_OK):
-        return str(cand)
+    for option in _executable_candidates(cand):
+        if option.is_file() and os.access(option, os.X_OK):
+            return str(option)
 
     return _sdk_tool(*sdk_relative)
 
@@ -127,8 +142,9 @@ def aapt2_path() -> str | None:
             # Highest version wins.
             for ver in sorted(bt.iterdir(), reverse=True):
                 cand = ver / "aapt2"
-                if cand.is_file():
-                    return str(cand)
+                for option in _executable_candidates(cand):
+                    if option.is_file():
+                        return str(option)
     return shutil.which("aapt2")
 
 

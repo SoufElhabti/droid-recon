@@ -7,13 +7,18 @@ perfectly usable tree, so any run that produced .java files counts as success.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 from .. import shell
 from ..log import ok, say, warn
+from .manifest import sha256_of
 
-DEFAULT_CACHE = Path.home() / ".cache" / "droid-recon" / "jadx"
+DEFAULT_CACHE = Path(os.environ.get("DROID_RECON_JADX_CACHE") or
+                     Path.home() / ".cache" / "droid-recon" / "jadx")
 JADX_TIMEOUT = 900
 
 
@@ -26,19 +31,33 @@ def java_files(tree: Path) -> list[Path]:
 
 
 def decompile(
-    apk: Path,
+    apk: Path | Sequence[Path],
     sha256: str,
     *,
     cache_root: Path | None = None,
     force: bool = False,
     timeout: int = JADX_TIMEOUT,
 ) -> Path | None:
-    """Decompile `apk` to a cached source tree. Returns the tree root, or None.
+    """Decompile one APK or a complete split set to one cached source tree.
 
     Returns None (rather than raising) when jadx is unavailable or produced nothing —
     the caller degrades to manifest-only analysis.
     """
-    out = cache_dir_for(sha256, cache_root)
+    apks = [Path(apk)] if isinstance(apk, (str, Path)) else [Path(p) for p in apk]
+    if not apks:
+        raise ValueError("no APKs supplied for decompilation")
+    if len(apks) == 1:
+        hashes = [sha256]
+        cache_key = sha256
+    else:
+        # The base hash alone is unsafe: changing a feature APK must invalidate the
+        # Java tree even when the base APK is byte-for-byte identical.
+        digest = hashlib.sha256()
+        hashes = [sha256_of(path) for path in apks]
+        for apk_hash in hashes:
+            digest.update(bytes.fromhex(apk_hash))
+        cache_key = digest.hexdigest()
+    out = cache_dir_for(cache_key, cache_root)
     marker = out / ".droid-recon-complete"
 
     if marker.exists() and not force:
@@ -55,9 +74,11 @@ def decompile(
         shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True, exist_ok=True)
 
-    say("code", f"jadx decompiling {apk.name} (up to {timeout}s)...")
+    label = apks[0].name + (f" (+{len(apks) - 1} splits)" if len(apks) > 1 else "")
+    say("code", f"jadx decompiling {label} (up to {timeout}s)...")
     proc = shell.run(
-        [jadx, "--no-res", "--no-debug-info", "--show-bad-code", "-d", str(out), str(apk)],
+        [jadx, "--no-res", "--no-debug-info", "--show-bad-code", "-d", str(out),
+         *(str(path) for path in apks)],
         timeout=timeout,
     )
 
@@ -73,5 +94,9 @@ def decompile(
     else:
         ok(f"jadx decompiled {len(produced)} .java files")
 
-    marker.write_text(f"{apk}\n{sha256}\nrc={proc.rc}\nfiles={len(produced)}\n")
+    marker.write_text(
+        "\n".join([f"{path}\t{apk_hash}" for path, apk_hash in zip(apks, hashes)]
+                  + [f"rc={proc.rc}", f"files={len(produced)}", ""]),
+        encoding="utf-8",
+    )
     return tree

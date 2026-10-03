@@ -69,7 +69,7 @@ def extract(tree: Path, authorities: list[str], max_files: int = 60000) -> dict:
         if files > max_files:
             break
         try:
-            text = java.read_text(errors="ignore")
+            text = java.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
 

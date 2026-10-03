@@ -226,15 +226,16 @@ def for_component(comp_type: str, package: str,
     """The payload set worth sending at a given component type.
 
     `code_keys` are extra keys recovered from the decompiled code (static/intents.py),
-    as [{"key": ..., "type": ...}]. When present they are used INSTEAD of guesses, and
-    ordered first, because they are the keys the component actually reads.
+    as [{"key": ..., "type": ...}]. String payloads are only sent to keys read as
+    strings (or whose type is unknown); typed probes use supported `am` extra types.
     """
     out: list[Payload] = []
-    keys = [k["key"] for k in (code_keys or [])]
+    string_keys = [k["key"] for k in (code_keys or [])
+                   if k.get("type", "unknown") in ("string", "unknown") and k.get("key")]
 
     if comp_type in ("activity", "activity-alias"):
-        out += webview_url_injection(keys=keys or None)
-        out += intent_redirection(package, keys=keys or None)
+        out += webview_url_injection(keys=string_keys or None)
+        out += intent_redirection(package, keys=string_keys or None)
     if code_keys:
         out += typed_probes(code_keys)
     out += generic_fuzz_extras()
@@ -256,9 +257,16 @@ def typed_probes(code_keys: list[dict]) -> list[Payload]:
         "bool": "true",
         "string_array": canary("ARR"),
     }
-    for entry in code_keys[:20]:
-        key, ktype = entry["key"], entry.get("type", "string")
+    for entry in code_keys:
+        key, ktype = entry.get("key"), entry.get("type", "unknown")
+        if not key or ktype not in _AM_FLAG:
+            continue  # `am` cannot build Parcelable, Serializable, or Bundle extras.
         val = hostile.get(ktype, canary("KEY"))
+        location = entry.get("source", "decompiled code")
+        if entry.get("line"):
+            location = f"{location}:{entry['line']}"
+        scope = ("this component" if entry.get("scope") != "app_fallback"
+                 else "the app (component mapping uncertain)")
         out.append(Payload(
             name=f"typed_{key}",
             attack_class="Unvalidated Intent extra (code-derived key)",
@@ -266,9 +274,11 @@ def typed_probes(code_keys: list[dict]) -> list[Payload]:
             expect={"traffic_host": CANARY_HOST if ktype == "string" else None,
                     "logcat_any": [canary("KEY")] if ktype != "string" else [],
                     "crash": True},
-            why=f"'{key}' is read by this component as {ktype}; sending a hostile value "
-                f"tests whether it is validated before use.",
+            why=f"'{key}' is read by {scope} as {ktype} at {location}; sending a hostile "
+                f"value tests whether it is validated before use.",
         ))
+        if len(out) >= 20:
+            break
     return out
 
 

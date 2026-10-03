@@ -1,5 +1,7 @@
 # droid-recon — ma.poneglyph.webviewlab
 
+> Historical sample from an earlier, developer-owned lab audit. It was not rerun with the current development snapshot, and the underlying APK/device evidence bundle is not included here. Treat the reported effects and severity as an example of the earlier workflow, not as current-version validation.
+
 **Triage:** INVESTIGATE — 13 third-party-reachable, browsable, debuggable, 24 sink hits
 
 ## Attack surface

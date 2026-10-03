@@ -15,7 +15,6 @@ from droid_recon.static.manifest import parse_manifest
 
 from .fixtures import KNOWN_ANSWERS_MANIFEST
 
-
 # ---- payload construction ----
 
 def test_extra_types_map_to_correct_am_flags():

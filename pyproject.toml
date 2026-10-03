@@ -4,19 +4,79 @@ build-backend = "hatchling.build"
 
 [project]
 name = "droid-recon"
-version = "0.1.0"
+version = "0.4.0.dev1"
 description = "Android offensive-security audit engine — static attack-surface mapping and dynamic IPC probing"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Poneglyph SARL" }]
 requires-python = ">=3.11"
 dependencies = []
+keywords = ["android", "apk", "offensive-security", "security-testing", "reverse-engineering"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Security",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
+dev = [
+  "build>=1.2.2",
+  "mypy>=1.15.0",
+  "pytest>=8.0.0",
+  "pytest-cov>=6.0.0",
+  "ruff>=0.11.0",
+]
 
 [project.scripts]
 droid-recon = "droid_recon.cli:main"
+droid-agent = "droid_recon.agent:main"
+
+[project.urls]
+Homepage = "https://github.com/SoufElhabti/droid-recon"
+Repository = "https://github.com/SoufElhabti/droid-recon.git"
+Issues = "https://github.com/SoufElhabti/droid-recon/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/droid_recon"]
 
+# Keep the buildable companion source alongside the installed Python package.
+# Map source files explicitly so local Gradle outputs never enter a release wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"android/companion/settings.gradle" = "droid_recon/assets/companion/settings.gradle"
+"android/companion/build.gradle" = "droid_recon/assets/companion/build.gradle"
+"android/companion/gradle.properties" = "droid_recon/assets/companion/gradle.properties"
+"android/companion/README.md" = "droid_recon/assets/companion/README.md"
+"android/companion/app/build.gradle" = "droid_recon/assets/companion/app/build.gradle"
+"android/companion/app/src/main/AndroidManifest.xml" = "droid_recon/assets/companion/app/src/main/AndroidManifest.xml"
+"android/companion/app/src/main/java/org/droidrecon/companion/ProbeActivity.java" = "droid_recon/assets/companion/app/src/main/java/org/droidrecon/companion/ProbeActivity.java"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+show_error_codes = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "mitmproxy.*"
+ignore_missing_imports = true

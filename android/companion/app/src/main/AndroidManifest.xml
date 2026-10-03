@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.droidrecon.companion">
+    <application
+        android:allowBackup="false"
+        android:label="Droid Recon Companion"
+        android:usesCleartextTraffic="false">
+        <activity
+            android:name=".ProbeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
+</manifest>

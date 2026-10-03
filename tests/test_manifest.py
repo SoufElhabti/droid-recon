@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import pytest
 
+from droid_recon import shell
 from droid_recon.models import classify_reach
+from droid_recon.static import manifest
 from droid_recon.static.manifest import parse_manifest
 
 from .fixtures import EXPECTED, KNOWN_ANSWERS_MANIFEST
@@ -18,6 +20,50 @@ from .fixtures import EXPECTED, KNOWN_ANSWERS_MANIFEST
 @pytest.fixture(scope="module")
 def surface():
     return parse_manifest(KNOWN_ANSWERS_MANIFEST)
+
+
+def test_invalid_apkanalyzer_xml_falls_back_to_numeric_aapt2_attributes(monkeypatch, tmp_path):
+    apk = tmp_path / "base.apk"
+    malformed = '''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+ android:versionCode="174" ="3.0.2" package="com.example.target" />'''
+    xmltree = '''N: android=http://schemas.android.com/apk/res/android (line=0)
+  E: manifest (line=0)
+    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=174
+    A: (0x0101021c)="3.0.2" (Raw: "3.0.2")
+    A: package="com.example.target" (Raw: "com.example.target")
+      E: uses-sdk (line=0)
+        A: (0x0101020c)=24
+        A: (0x01010270)=36
+      E: application (line=0)
+        A: (0x01010280)=false
+          E: activity (line=0)
+            A: (0x01010003)=".MainActivity" (Raw: ".MainActivity")
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+              E: intent-filter (line=0)
+                  E: action (line=0)
+                    A: (0x01010003)="android.intent.action.VIEW"
+                  E: category (line=0)
+                    A: (0x01010003)="android.intent.category.BROWSABLE"
+                  E: data (line=0)
+                    A: (0x01010027)="authpoint"
+'''
+
+    def fake_run(argv, timeout):
+        output = malformed if argv[0] == "apkanalyzer" else xmltree
+        return shell.Proc(argv=argv, rc=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(manifest.shell, "which", lambda *args: "apkanalyzer")
+    monkeypatch.setattr(manifest.shell, "aapt2_path", lambda: "aapt2")
+    monkeypatch.setattr(manifest.shell, "run", fake_run)
+    result = parse_manifest(manifest.dump_manifest_xml(apk))
+    assert (result.package, result.version_code, result.version_name) == (
+        "com.example.target", 174, "3.0.2")
+    assert (result.min_sdk, result.target_sdk, result.allow_backup) == (24, 36, False)
+    activity = result.components[0]
+    assert activity.name == "com.example.target.MainActivity"
+    assert activity.exported is True
+    assert activity.intent_filters[0].data == [{"scheme": "authpoint"}]
 
 
 def test_package_and_metadata(surface):
@@ -116,9 +162,14 @@ def test_summary_counts(surface):
     s = surface.summary()
     assert s["total_components"] == len(EXPECTED)
     assert s["exported_components"] == sum(1 for e in EXPECTED.values() if e[0])
-    assert s["reachable_third_party"] == sum(
+    read_reachable = sum(
         1 for e in EXPECTED.values() if e[1] in ("third_party_app", "browser")
     )
+    guarded_read = next(c for c in surface.components
+                        if c.name.endswith("ReadGuardedProvider"))
+    assert guarded_read.reachable_from == "none"
+    assert guarded_read.publicly_reachable is True  # open write/call operation
+    assert s["reachable_third_party"] == read_reachable + 1
 
 
 def test_roundtrip_serialisation(surface):

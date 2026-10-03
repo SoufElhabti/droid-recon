@@ -19,26 +19,53 @@ Design constraints that matter for agent use:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from . import report as report_mod
+from . import __version__, apk_identity, evidence
 from . import chains as chains_mod
+from . import report as report_mod
 from . import triage as triage_mod
-from .device import (certs, emulator, exploit, explorer, install, network, oracle,
-                     payloads, probes, screen, storage)
+from .device import (
+    certs,
+    emulator,
+    exploit,
+    explorer,
+    install,
+    network,
+    ordinary,
+    payloads,
+    probes,
+    screen,
+    storage,
+)
+from .device_agent.deploy import ensure_agent as _ensure_agent
 from .frida import native as native_mod
 from .frida import server as frida_server
 from .models import Component
+from .permissions import READ_ONLY
 from .session import DEFAULT_ROOT, Session
-from .static import decompile, ghidra, manifest, resources, sweep, urimatcher
+from .static import (
+    decompile,
+    flows,
+    ghidra,
+    intents,
+    lottie,
+    manifest,
+    resources,
+    sweep,
+    urimatcher,
+)
+from .transport import DeviceAgentConfig, FridaTransportConfig
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "droid-recon", "version": "0.2.0"}
+SERVER_INFO = {"name": "droid-recon", "version": __version__}
 
 _SESSIONS_ROOT = Path(DEFAULT_ROOT)
+MCP_MUTATION_ENV = "DROID_RECON_MCP_ALLOW_MUTATIONS"
 
 # ---------------------------------------------------------------- tool registry
 
@@ -67,9 +94,31 @@ def _session(package: str) -> Session:
     return Session.open(package, _SESSIONS_ROOT)
 
 
+def _frida_transport(args: dict) -> FridaTransportConfig:
+    mode = args.get("frida_transport") or "auto"
+    if mode not in ("tcp", "usb", "auto"):
+        mode = "auto"
+    return FridaTransportConfig(mode=mode)
+
+
+_AGENT_CONFIG = DeviceAgentConfig()
+_AGENT_CLIENT = None
+
+
+def _agent():
+    """Get or create the device agent client, cached for the session."""
+    global _AGENT_CLIENT
+    if _AGENT_CLIENT and _AGENT_CLIENT.is_alive():
+        return _AGENT_CLIENT
+    serial = emulator.running_serial()
+    if serial:
+        _AGENT_CLIENT = _ensure_agent(_AGENT_CONFIG, serial)
+    return _AGENT_CLIENT
+
+
 def _surface_for(target: str):
     apks = manifest.resolve_apks(target)
-    return manifest.analyze(apks[0].parent if len(apks) > 1 else apks[0]), apks
+    return manifest.analyze(apks), apks
 
 
 # ---------------------------------------------------------------- device tools
@@ -146,27 +195,42 @@ def _install_apk(args: dict) -> dict:
       _obj({"target": _S, "skip_resources": _B}, ["target"]))
 def _static_analyze(args: dict) -> dict:
     surface, apks = _surface_for(args["target"])
-    if not args.get("skip_resources"):
-        res_root = decompile.DEFAULT_CACHE.parent / "res" / surface.apk_sha256[:16]
-        if resources.extract_resources(apks[0], res_root):
-            surface.fileprovider_paths = resources.find_fileprovider_paths(res_root)
-            nsc = resources.find_network_security_config(res_root)
-            if nsc and nsc["issues"]:
-                surface.app_issues += [f"networkSecurityConfig: {i}" for i in nsc["issues"]]
     sess = _session(surface.package)
+    sess.begin_coverage_run()
+    if not args.get("skip_resources"):
+        decoded = resources.analyze_all(apks, decompile.DEFAULT_CACHE.parent / "res")
+        surface.fileprovider_paths = decoded["fileprovider_paths"]
+        for nsc in decoded["network_configs"]:
+            surface.app_issues.extend(
+                f"networkSecurityConfig ({Path(nsc['source_apk']).name}): {issue}"
+                for issue in nsc["issues"]
+            )
+        for entry in decoded["status"]:
+            sess.record_coverage("resources", entry["status"],
+                                 component=entry["apk"], reason=entry.get("reason"))
+    else:
+        sess.record_coverage("resources", "skipped", reason="skip_resources requested")
     sess.write_surface(surface)
+    evidence.record(sess.dir, surface)
+    for component in surface.components:
+        sess.record_coverage(
+            "manifest", "tested", component=component.name,
+            result_state=("STATIC_CANDIDATE" if component.issues and
+                          component.reachable_from in ("third_party_app", "browser")
+                          else None),
+        )
     return {
         "package": surface.package,
         "verdict": sweep.verdict(surface),
         "summary": surface.summary(),
         "app_issues": surface.app_issues,
-        "reachable_components": [
+            "reachable_components": [
             {"name": c.name, "type": c.type, "reachable_from": c.reachable_from,
              "permission": c.read_permission or c.permission,
              "authorities": c.authorities, "deeplinks": c.deeplinks()[:4],
              "issues": c.issues}
             for c in surface.components
-            if c.reachable_from in ("third_party_app", "browser")
+            if c.publicly_reachable
         ][:40],
         "artifact": str(sess.surface_path),
         "session_dir": str(sess.dir),
@@ -176,32 +240,103 @@ def _static_analyze(args: dict) -> dict:
 @tool("code_analyze",
       "Decompile with jadx (cached by APK hash, ~15s/18MB) and sweep for sinks/sources, "
       "hardcoded secrets, and — most importantly — ContentProvider URI paths and call() "
-      "methods recovered from UriMatcher.addURI literals. Provider probing barely works "
-      "without this.",
+      "methods recovered from UriMatcher.addURI literals. Also fingerprints Lottie "
+      "stacks and Q1-Q10 delivery signals using obfuscation-resistant strings.",
       _obj({"target": _S, "force": _B, "top": _I}, ["target"]))
 def _code_analyze(args: dict) -> dict:
     surface, apks = _surface_for(args["target"])
     sess = _session(surface.package)
-    surface = sess.read_surface() or surface
-    tree = decompile.decompile(apks[0], surface.apk_sha256, force=args.get("force", False))
+    existing = sess.read_surface()
+    if existing and apk_identity.same_surface(existing, surface):
+        surface = existing
+    else:
+        sess.write_surface(surface)
+    tree = decompile.decompile(apks, surface.apk_sha256, force=args.get("force", False))
     if tree is None:
+        sess.record_coverage("code", "unsupported",
+                             reason="jadx unavailable or produced no sources")
         return {"ok": False, "error": "jadx produced no sources"}
     code = sweep.sweep(tree, surface)
     auths = sorted({a for c in surface.components for a in c.authorities})
     code.provider_paths = urimatcher.extract(tree, auths)
+    intent_extras = intents.extract(tree, [c.name for c in surface.components])
+    code.lottie = lottie.analyze(tree, apks)
     doc = code.to_dict()
+    doc["apk_sha256"] = surface.apk_sha256
+    doc["apk_sha256s"] = surface.apk_sha256s
+    doc["intent_extras"] = intent_extras
+    doc["flow_candidates"] = flows.analyze(tree, surface)
     doc["focused"] = sweep.focused(code, surface, top_n=args.get("top", 40))
     doc["verdict"] = sweep.verdict(surface, code)
     sess.write_code_report(doc)
+    sess.record_coverage("code", "tested", check="jadx/source sweep",
+                         result_state=("STATIC_CANDIDATE" if
+                                       code.summary()["sink_hits_app"] else None))
+    sess.record_coverage("code", "tested", check="Intent extra extraction")
+    sess.record_coverage("code", "tested", check="ContentProvider path extraction")
+    sess.record_coverage(
+        "code", "tested", check="source-to-sink candidate analysis",
+        result_state=("STATIC_CANDIDATE" if doc["flow_candidates"]["candidates"] else None),
+    )
     return {
         "package": surface.package,
         "verdict": doc["verdict"],
         "summary": code.summary(),
         "provider_paths": code.provider_paths.get("paths", {}),
         "provider_call_methods": code.provider_paths.get("call_methods", []),
+        "intent_extras": {
+            "components": len(intent_extras["by_component"]),
+            "unique_keys": len(intent_extras["global_keys"]),
+        },
+        "lottie": lottie.brief(code.lottie),
         "focused_sinks": doc["focused"].get("sinks", [])[:15],
         "secrets": doc["focused"].get("secrets", [])[:10],
         "artifact": str(sess.code_path),
+    }
+
+
+@tool("lottie_scan",
+      "Batch-triage a corpus of APKs for the exploitable Lottie stack, ranked. "
+      "Archive-only — no jadx, no device — so it is seconds per APK and is meant to "
+      "pick which targets deserve a full code_analyze. Verdict "
+      "'dotlottie_native_expressions_b64' means the dotLottie native player, the ThorVG "
+      "expression engine and the base64 raw-write sink are all present in the same ELF, "
+      "i.e. the preconditions for the cross-player expression UAF are structurally there. "
+      "Presence is not exploitability: confirm the app actually renders untrusted "
+      "animation content before treating a candidate as a finding.",
+      _obj({"targets": {"type": "array", "items": _S}, "installed": _B, "out": _S},
+           []))
+def _lottie_scan(args: dict) -> dict:
+    targets: dict[str, list[Path]] = {}
+    if args.get("installed"):
+        from .device import install as install_mod
+        out = Path(args.get("out") or "./apk-corpus")
+        out.mkdir(parents=True, exist_ok=True)
+        for pkg in install_mod.list_packages(None, third_party_only=True):
+            dest = out / pkg
+            dest.mkdir(parents=True, exist_ok=True)
+            local = install_mod.pull_installed_apk(pkg, dest, None)
+            if local:
+                targets[pkg] = local
+    for raw in args.get("targets") or []:
+        path = Path(raw)
+        if path.is_dir():
+            apks = sorted(path.glob("*.apk"))
+            if apks:
+                targets[path.name] = apks
+        elif path.is_file():
+            targets[path.name] = [path]
+    if not targets:
+        return {"ok": False, "error": "no targets — pass `targets` or set `installed`"}
+    result = lottie.scan_many(targets)
+    return {
+        "scanned": result["scanned"],
+        "candidates": result["candidates"],
+        "counts": result["counts"],
+        "errors": result["errors"],
+        "results": result["results"][:40],
+        "next": ("code_analyze on each candidate, then frida_run(script='lottie_tracer') "
+                 "to establish whether the animation bytes are attacker-influenced"),
     }
 
 
@@ -228,7 +363,8 @@ def _ghidra_analyze(args: dict) -> dict:
             results.append({"library": so.name,
                             "functions": blob.get("functions_total"),
                             "findings": blob.get("findings", {})})
-    (sess.dir / "ghidra.json").write_text(json.dumps(results, indent=2))
+    (sess.dir / "ghidra.json").write_text(json.dumps(results, indent=2),
+                                          encoding="utf-8")
     return {"package": surface.package, "libraries_found": [p.name for p in libs],
             "analysed": results, "artifact": str(sess.dir / "ghidra.json")}
 
@@ -252,14 +388,21 @@ def _ghidra_decompile(args: dict) -> dict:
 def _probe_ipc(args: dict) -> dict:
     surface, apks = _surface_for(args["target"])
     sess = _session(surface.package)
-    surface = sess.read_surface() or surface
+    cached = sess.read_surface()
+    if cached and apk_identity.same_surface(cached, surface):
+        surface = cached
+    else:
+        sess.write_surface(surface)
     serial = emulator.running_serial()
     if not serial:
+        sess.record_coverage("ipc", "failed", reason="no device attached")
         return {"ok": False, "error": "no device — call device_up"}
+    evidence.record(sess.dir, surface, serial=serial, execution_context="adb_shell")
 
     code = sess.read_code_report() or {}
-    pp = code.get("provider_paths") or {}
-    ctx = probes.ProbeContext(package=surface.package, serial=serial)
+    pp = (code.get("provider_paths") or {}
+          if apk_identity.report_matches_apks(code, surface) else {})
+    ctx = probes.ProbeContext(package=surface.package, serial=serial, agent=_agent())
 
     wanted = set(args.get("types") or ["activity", "provider", "receiver", "service"])
     if "activity" in wanted:
@@ -267,39 +410,69 @@ def _probe_ipc(args: dict) -> dict:
     targets = [c for c in surface.components
                if c.type in wanted
                and (args.get("include_shell_only")
-                    or c.reachable_from in ("third_party_app", "browser"))]
-    limit = args.get("limit") or 0
+                    or c.publicly_reachable)]
+    limit = max(0, args.get("limit") or 0)
+    selected = {c.name for c in targets[:limit] if limit} if limit else {
+        c.name for c in targets}
+    for comp in surface.components:
+        if comp.name not in selected:
+            reason = ("component type filter" if comp.type not in wanted else
+                      "manifest reachability excludes an ordinary caller"
+                      if not args.get("include_shell_only") and not comp.publicly_reachable
+                      else f"limit {limit}")
+            sess.record_coverage("ipc", "skipped", component=comp.name, reason=reason)
     if limit:
         targets = targets[:limit]
 
     made = 0
+    probed = 0
     for comp in targets:
+        before_count = sess.count_observations()
         if comp.type == "provider":
             known = pp.get("paths", {})
             floating = pp.get("floating_paths", [])
             for auth in comp.authorities:
                 paths = known.get(auth) or (floating[:4] + list(urimatcher.FALLBACK_PATHS[:8]))
                 for p in paths[:14]:
-                    sess.add_observation(probes.query_provider(ctx, comp, auth, p)); made += 1
+                    sess.add_observation(probes.query_provider(ctx, comp, auth, p))
+                    made += 1
                 for m in (pp.get("call_methods") or [])[:6]:
-                    sess.add_observation(probes.call_provider(ctx, comp, auth, m)); made += 1
+                    sess.add_observation(probes.call_provider(ctx, comp, auth, m))
+                    made += 1
                 if args.get("traversal"):
                     for t in urimatcher.TRAVERSAL_PATHS:
                         sess.add_observation(probes.read_provider_file(ctx, comp, auth, t))
                         made += 1
         elif comp.type in ("activity", "activity-alias"):
-            sess.add_observation(probes.launch_activity(ctx, comp)); made += 1
+            sess.add_observation(probes.launch_activity(ctx, comp))
+            made += 1
             for uri in comp.deeplinks()[:5]:
-                sess.add_observation(probes.launch_deeplink(ctx, comp, uri)); made += 1
+                sess.add_observation(probes.launch_deeplink(ctx, comp, uri))
+                made += 1
         elif comp.type == "receiver":
             for f in comp.intent_filters:
                 for a in f.actions[:4]:
-                    sess.add_observation(probes.send_broadcast(ctx, comp, a)); made += 1
+                    sess.add_observation(probes.send_broadcast(ctx, comp, a))
+                    made += 1
         elif comp.type == "service":
-            sess.add_observation(probes.start_service(ctx, comp)); made += 1
+            sess.add_observation(probes.start_service(ctx, comp))
+            made += 1
+        observed = sess.observations()[before_count:]
+        if observed:
+            probed += 1
+            sess.record_coverage(
+                "ipc", "tested", component=comp.name,
+                result_state="OBSERVED" if any(o.interesting for o in observed) else None,
+                evidence_ids=[o.id for o in observed][:20],
+            )
+        else:
+            sess.record_coverage(
+                "ipc", "skipped", component=comp.name,
+                reason="no probeable declared input",
+            )
 
     obs = sess.observations()
-    return {"package": surface.package, "components_probed": len(targets),
+    return {"package": surface.package, "components_probed": probed,
             "observations_added": made, "total_observations": len(obs),
             "interesting": [o.to_dict() for o in obs if o.interesting][:15],
             "artifact": str(sess.observations_path)}
@@ -339,7 +512,7 @@ def _send_payload(args: dict) -> dict:
                                 "receiver": "broadcast",
                                 "service": "start-service"}.get(comp.type, "start")
     att = exploit.run_payload(args["package"], comp, p, serial=serial, verb=verb,
-                              screenshots_dir=sess.screenshots)
+                              screenshots_dir=sess.screenshots, agent=_agent())
     sess.add_observation(att.to_observation(f"O{sess.count_observations()+1:04d}", args["package"]))
     return att.to_dict()
 
@@ -353,7 +526,11 @@ def _send_payload(args: dict) -> dict:
 def _exploit_campaign(args: dict) -> dict:
     surface, _ = _surface_for(args["target"])
     sess = _session(surface.package)
-    surface = sess.read_surface() or surface
+    existing = sess.read_surface()
+    if existing and apk_identity.same_surface(existing, surface):
+        surface = existing
+    else:
+        sess.write_surface(surface)
     serial = emulator.running_serial()
     if not serial:
         return {"ok": False, "error": "no device"}
@@ -367,11 +544,16 @@ def _exploit_campaign(args: dict) -> dict:
         return {"ok": True, "attempts": 0,
                 "note": "no third-party-reachable components of these types"}
 
+    code_report = sess.read_code_report() or {}
+    code_extras = (code_report.get("intent_extras")
+                   if apk_identity.report_matches_apks(code_report, surface) else None)
     hosts_seen: list[str] = []
     attempts = exploit.run_campaign(
         surface.package, comps, serial=serial, screenshots_dir=sess.screenshots,
         traffic_hosts_fn=lambda: hosts_seen,
         max_payloads_per_component=args.get("max_payloads", 10),
+        code_extras=code_extras,
+        agent=_agent(),
     )
     path = sess.dir / "exploits.jsonl"
     with path.open("a", encoding="utf-8") as fh:
@@ -392,6 +574,68 @@ def _exploit_campaign(args: dict) -> dict:
     }
 
 
+@tool("verify_caller",
+      "Probe one manifest component from a separately installed ordinary Android app UID. "
+      "Builds/installs a no-permission companion on an emulator, then records whether "
+      "the OS accepted, denied, or could not confirm the IPC call. This is reachability "
+      "evidence, not proof of a vulnerability.",
+      _obj({"target": _S, "component": _S, "operation": _S, "uri": _S,
+            "action": _S, "method": _S, "serial": _S, "companion_apk": _S},
+           ["target", "component"]))
+def _verify_caller(args: dict) -> dict:
+    surface, _ = _surface_for(args["target"])
+    comp = next((c for c in surface.components if c.name == args["component"]), None)
+    if comp is None:
+        return {"ok": False, "error": "component is not declared in the target manifest"}
+    request = ordinary.request_for_component(
+        surface.package, comp, operation=args.get("operation"),
+        uri=args.get("uri"), action=args.get("action"),
+        method=args.get("method"),
+    )
+    request.payload()  # reject unsupported/malformed requests before build or install
+    sess = _session(surface.package)
+    existing = sess.read_surface()
+    if not existing or not apk_identity.same_surface(existing, surface):
+        sess.write_surface(surface)
+    serial = args.get("serial") or emulator.running_serial()
+    if not serial:
+        return {"ok": False, "error": "no emulator attached"}
+    built = (ordinary.CompanionBuild("built", Path(args["companion_apk"]))
+             if args.get("companion_apk") else ordinary.build_companion())
+    if built.status != "built" or built.apk is None:
+        sess.record_coverage("ordinary_uid", "unsupported", component=comp.name,
+                             reason=built.message)
+        return {"ok": False, "status": built.status, "message": built.message}
+    installed = ordinary.install_companion(built.apk, serial=serial)
+    if installed.status != "installed":
+        sess.record_coverage("ordinary_uid", "failed", component=comp.name,
+                             reason=installed.message)
+        return {"ok": False, "status": "install_failed", "message": installed.message}
+    result = ordinary.run_probe(
+        request, serial=serial, trusted_source=installed.verified_build)
+    evidence.record(sess.dir, surface, serial=serial,
+                    execution_context="ordinary_app_uid")
+    document = {"component": (None if request.operation == "deeplink" else comp.name),
+                "declared_component": comp.name,
+                "resolution_scope": ("package" if request.operation == "deeplink"
+                                     else "component"),
+                **result.to_dict()}
+    artifact = sess.dir / "ordinary_results.jsonl"
+    with artifact.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(document, ensure_ascii=False) + "\n")
+    sess.record_coverage(
+        "ordinary_uid", "tested",
+        component=(None if request.operation == "deeplink" else comp.name),
+        check=(f"deeplink candidate {comp.name}"
+               if request.operation == "deeplink" else request.operation),
+        result_state=("OBSERVED" if result.accessible is not None else "INCONCLUSIVE"),
+        evidence_ids=[request.id],
+    )
+    return {"ok": True, "package": surface.package, "component": comp.name,
+            "resolution_scope": document["resolution_scope"],
+            "result": result.to_dict(), "artifact": str(artifact)}
+
+
 @tool("provider_sqli",
       "Test a content provider's selection clause for unparameterised SQL. A SQLite parse "
       "error proves the string reached the query engine rather than a bound parameter.",
@@ -404,7 +648,7 @@ def _provider_sqli(args: dict) -> dict:
                  if args["authority"] in c.authorities), None) or Component(
         name=args["authority"], type="provider", exported=True, reachable_from="shell")
     res = exploit.probe_provider_sqli(args["package"], comp, args["authority"],
-                                      args.get("path", ""), serial)
+                                      args.get("path", ""), serial, agent=_agent())
     return {"authority": args["authority"], "results": res,
             "sql_reached_engine": any(r["sql_error"] for r in res)}
 
@@ -444,12 +688,10 @@ def _network_capture(args: dict) -> dict:
     if cap is None:
         return {"ok": False, "error": "mitmdump failed to start"}
     network.set_device_proxy(port, serial)
-    from . import shell as _sh
-    _sh.adb_shell(["am", "broadcast", "-a", "android.intent.action.PROXY_CHANGE"],
-                  serial=serial, timeout=20)
+    from .device import bootstrap
+    bootstrap.notify_proxy_change(serial)
     if args.get("launch", True):
-        _sh.adb_shell(["monkey", "-p", args["package"], "-c",
-                       "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=30)
+        bootstrap.launch_app(args["package"], serial)
     time.sleep(max(5, args.get("duration", 25)))
     cap.stop()
     network.clear_device_proxy(serial)
@@ -457,53 +699,74 @@ def _network_capture(args: dict) -> dict:
     recs = network.read_flows(cap.flows_path)
     analysis = network.analyse(recs, args["package"])
     network.export_har(recs, out / "traffic.har")
-    (out / "analysis.json").write_text(json.dumps(analysis, indent=2))
+    (out / "analysis.json").write_text(json.dumps(analysis, indent=2),
+                                       encoding="utf-8")
     return {**analysis, "har": str(out / "traffic.har"),
             "flows_artifact": str(cap.flows_path)}
 
 
 # ---------------------------------------------------------------- frida tools
 
-@tool("frida_setup", "Push and start a version-matched frida-server. Needed after reboot.",
-      _obj({}))
+@tool("frida_setup",
+      "Push and start a version-matched frida-server. Needed after reboot. "
+      "frida_transport: tcp (port-forwarded), usb, or auto (default).",
+      _obj({"frida_transport": _S}))
 def _frida_setup(args: dict) -> dict:
-    good, msg = frida_server.ensure_server(emulator.running_serial())
-    return {"ok": good, "message": msg, "scripts": sorted(frida_server.list_scripts())}
+    transport = _frida_transport(args)
+    good, msg = frida_server.ensure_server(emulator.running_serial(), transport=transport)
+    return {"ok": good, "message": msg, "transport": transport.mode,
+            "scripts": sorted(frida_server.list_scripts())}
 
 
 @tool("frida_run",
       "Run a Frida script against a package. Built-ins: ssl_unpin (defeat certificate "
       "pinning before a capture), crypto_logger (keys/IVs/algorithms), webview_hooks "
-      "(loadUrl / addJavascriptInterface / file-access settings).",
-      _obj({"package": _S, "script": _S, "duration": _I, "attach": _B}, ["package"]))
+      "(loadUrl / addJavascriptInterface / file-access settings). "
+      "(loadUrl / addJavascriptInterface / file-access settings), lottie_tracer "
+      "(composition sources plus sanitized arguments and Java call stacks). "
+      "frida_transport: tcp, usb, or auto (default).",
+      _obj({"package": _S, "script": _S, "duration": _I, "attach": _B,
+            "frida_transport": _S}, ["package"]))
 def _frida_run(args: dict) -> dict:
     serial = emulator.running_serial()
+    transport = _frida_transport(args)
     scripts = frida_server.list_scripts()
     name = args.get("script") or "ssl_unpin"
     path = scripts.get(name) or Path(name)
     good, out = frida_server.run_script(args["package"], path, serial,
                                         spawn=not args.get("attach", False),
-                                        duration=args.get("duration", 25))
-    return {"ok": good, "script": str(path), "output": out[:6000]}
+                                        duration=args.get("duration", 25),
+                                        transport=transport)
+    sess = _session(args["package"])
+    artifact = frida_server.persist_output(out, sess.dir / "frida", path.stem)
+    return {
+        "ok": good,
+        "script": str(path),
+        "output": frida_server.output_excerpt(out, 6000),
+        "artifact": str(artifact) if artifact else None,
+    }
 
 
 @tool("native_trace",
       "Trace the native layer. mode=jni recovers the Java<->native mapping including "
       "dynamically-registered methods that appear NOWHERE in jadx output; mode=libc shows "
       "files/sockets/commands the native code touches; mode=exports hooks every export of "
-      "the app's own .so files.",
+      "the app's own .so files. frida_transport: tcp, usb, or auto (default).",
       _obj({"package": _S, "mode": _S, "duration": _I, "modules": {"type": "array", "items": _S},
-            "attach": _B}, ["package"]))
+            "attach": _B, "frida_transport": _S}, ["package"]))
 def _native_trace(args: dict) -> dict:
     serial = emulator.running_serial()
     sess = _session(args["package"])
+    transport = _frida_transport(args)
     good, res = native_mod.trace(
         args["package"], args.get("mode", "jni"), serial=serial,
         modules=args.get("modules"), duration=args.get("duration", 25),
         spawn=not args.get("attach", False), out_dir=sess.dir / "native",
+        transport=transport,
     )
     if good:
-        (sess.dir / f"native_{args.get('mode','jni')}.json").write_text(json.dumps(res, indent=2))
+        (sess.dir / f"native_{args.get('mode','jni')}.json").write_text(
+            json.dumps(res, indent=2), encoding="utf-8")
     return {"ok": good, **res}
 
 
@@ -531,12 +794,12 @@ def _app_authenticate(args: dict) -> dict:
         creds = explorer.Credentials(args["username"], args["password"])
     else:
         creds = explorer.Credentials.load(args.get("credentials_file"))
-    from . import shell as _sh
-    _sh.adb_shell(["monkey", "-p", args["package"], "-c",
-                   "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=30)
+    from .device import bootstrap
+    bootstrap.launch_app(args["package"], serial)
     import time
     time.sleep(3)
-    return explorer.authenticate(args["package"], creds, serial, sess.screenshots)
+    return explorer.authenticate(args["package"], creds, serial, sess.screenshots,
+                                  agent=_agent())
 
 
 @tool("explore_app",
@@ -550,8 +813,10 @@ def _explore_app(args: dict) -> dict:
     res = explorer.explore(args["package"], serial,
                            max_screens=args.get("max_screens", 20),
                            max_depth=args.get("max_depth", 3),
-                           shots=sess.screenshots)
-    (sess.dir / "screen_graph.json").write_text(json.dumps(res, indent=2))
+                           shots=sess.screenshots,
+                           agent=_agent())
+    (sess.dir / "screen_graph.json").write_text(json.dumps(res, indent=2),
+                                                encoding="utf-8")
     return {**res, "artifact": str(sess.dir / "screen_graph.json")}
 
 
@@ -561,29 +826,30 @@ def _explore_app(args: dict) -> dict:
       _obj({"package": _S, "screenshot": _B}))
 def _ui_state(args: dict) -> dict:
     serial = emulator.running_serial()
-    xml = screen.ui_tree_xml(serial)
+    ag = _agent()
+    xml = screen.ui_tree_xml(serial, agent=ag)
     items = screen.ui_summary(xml or "", max_items=60)
     shot = None
     if args.get("screenshot", True):
         sess = _session(args.get("package") or "_scratch")
-        p = screen.capture(sess.screenshots, "ui_state", serial)
+        p = screen.capture(sess.screenshots, "ui_state", serial, agent=ag)
         shot = str(p) if p else None
-    return {"focus": screen.current_focus(serial), "elements": items, "screenshot": shot}
+    return {"focus": screen.current_focus(serial, agent=ag), "elements": items, "screenshot": shot}
 
 
 @tool("tap", "Tap a screen coordinate.", _obj({"x": _I, "y": _I}, ["x", "y"]))
 def _tap(args: dict) -> dict:
-    from . import shell as _sh
-    _sh.adb_shell(["input", "tap", str(args["x"]), str(args["y"])],
-                  serial=emulator.running_serial(), timeout=25)
+    from .device_agent.runtime import exec_on_device
+    exec_on_device(["input", "tap", str(args["x"]), str(args["y"])],
+                   agent=_agent(), serial=emulator.running_serial(), timeout=25)
     return {"ok": True}
 
 
 @tool("input_text", "Type text into the focused field.", _obj({"text": _S}, ["text"]))
 def _input_text(args: dict) -> dict:
-    from . import shell as _sh
-    _sh.adb_shell(["input", "text", explorer._escape(args["text"])],
-                  serial=emulator.running_serial(), timeout=25)
+    from .device_agent.runtime import exec_on_device
+    exec_on_device(["input", "text", explorer._escape(args["text"])],
+                   agent=_agent(), serial=emulator.running_serial(), timeout=25)
     return {"ok": True}
 
 
@@ -596,12 +862,14 @@ def _input_text(args: dict) -> dict:
 def _read_app_storage(args: dict) -> dict:
     serial = emulator.running_serial()
     sess = _session(args["package"])
-    pulled = storage.pull_private_data(args["package"], sess.storage, serial)
+    agent = _agent()
+    pulled = storage.pull_private_data(args["package"], sess.storage, serial, agent=agent)
     return {
         "pulled": pulled,
         "prefs_secrets": storage.scan_prefs_for_secrets(sess.storage)[:30],
         "databases": storage.list_databases(sess.storage),
-        "world_readable": storage.world_readable_scan(args["package"], serial)[:25],
+        "world_readable": storage.world_readable_scan(args["package"], serial,
+                                                      agent=agent)[:25],
         "note": ("shared_prefs/database contents need root to read, so they matter only "
                  "under a rooted-device or backup threat model. world_readable entries "
                  "are reachable by any app with no root at all."),
@@ -621,7 +889,7 @@ def _build_chains(args: dict) -> dict:
     exploits = []
     ep = sess.dir / "exploits.jsonl"
     if ep.exists():
-        for line in ep.read_text(errors="replace").splitlines():
+        for line in ep.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.strip():
                 try:
                     exploits.append(json.loads(line))
@@ -630,11 +898,11 @@ def _build_chains(args: dict) -> dict:
     traffic = None
     tp = sess.dir / "network" / "analysis.json"
     if tp.exists():
-        traffic = json.loads(tp.read_text())
+        traffic = json.loads(tp.read_text(encoding="utf-8"))
     native = None
     gp = sess.dir / "ghidra.json"
     if gp.exists():
-        blobs = json.loads(gp.read_text())
+        blobs = json.loads(gp.read_text(encoding="utf-8"))
         if blobs:
             native = {"program": blobs[0].get("library"), "findings": blobs[0].get("findings")}
 
@@ -645,7 +913,7 @@ def _build_chains(args: dict) -> dict:
         built = [chains_mod.verify(c, package=args["package"], serial=serial)
                  for c in built]
     (sess.dir / "chains.json").write_text(
-        json.dumps([c.to_dict() for c in built], indent=2))
+        json.dumps([c.to_dict() for c in built], indent=2), encoding="utf-8")
     return {"summary": chains_mod.summarise(built),
             "chains": [c.to_dict() for c in built][:15],
             "artifact": str(sess.dir / "chains.json")}
@@ -659,11 +927,11 @@ def _triage(args: dict) -> dict:
     surface = sess.read_surface()
     if not surface:
         return {"ok": False, "error": "run static_analyze first"}
-    res = triage_mod.triage(surface, sess.observations(), start_index=sess.count_findings())
-    for f in res.findings:
-        sess.add_finding(f)
+    res = triage_mod.triage(surface, sess.observations())
+    sess.replace_findings(res.findings)
     (sess.dir / "triage_candidates.json").write_text(
-        json.dumps({"candidates": res.candidates, "rejected": res.rejected[:150]}, indent=2))
+        json.dumps({"candidates": res.candidates, "rejected": res.rejected[:150]}, indent=2),
+        encoding="utf-8")
     return {**res.summary(),
             "findings": [f.to_dict() for f in res.findings][:15],
             "candidates": res.candidates[:15]}
@@ -677,7 +945,7 @@ def _get_report(args: dict) -> dict:
     md, js, doc = report_mod.write(sess)
     if args.get("format") == "json":
         return doc
-    return {"markdown": md.read_text(), "json_artifact": str(js)}
+    return {"markdown": md.read_text(encoding="utf-8"), "json_artifact": str(js)}
 
 
 @tool("session_status", "What has been done for this package so far, and what to do next.",
@@ -725,7 +993,10 @@ def _error(rid, code, message) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
-def handle(msg: dict) -> dict | None:
+def handle(msg: dict, *, allow_mutating: bool = False) -> dict | None:
+    """Handle one request. Tool policy is enforced here, outside any model."""
+    if not isinstance(msg, dict):
+        return _error(None, -32600, "invalid JSON-RPC request")
     method = msg.get("method")
     rid = msg.get("id")
 
@@ -738,13 +1009,27 @@ def handle(msg: dict) -> dict | None:
     if method in ("notifications/initialized", "initialized"):
         return None  # notification: no reply
     if method == "tools/list":
-        return _result(rid, {"tools": TOOLS})
+        available = TOOLS if allow_mutating else [t for t in TOOLS if t["name"] in READ_ONLY]
+        return _result(rid, {"tools": available})
     if method == "tools/call":
         params = msg.get("params") or {}
+        if not isinstance(params, dict):
+            return _error(rid, -32602, "tool parameters must be an object")
         name = params.get("name")
+        if not isinstance(name, str):
+            return _error(rid, -32602, "tool name must be a string")
         fn = _HANDLERS.get(name)
         if fn is None:
             return _error(rid, -32601, f"unknown tool: {name}")
+        if not allow_mutating and name not in READ_ONLY:
+            return _result(rid, {
+                "content": [{"type": "text", "text": json.dumps({
+                    "error": "permission_denied",
+                    "message": (f"{name} requires operator opt-in. Restart the MCP server "
+                                f"with --allow-mutating-tools or set {MCP_MUTATION_ENV}=1."),
+                })}],
+                "isError": True,
+            })
         try:
             out = fn(params.get("arguments") or {})
             return _result(rid, {
@@ -766,8 +1051,19 @@ def handle(msg: dict) -> dict | None:
     return _error(rid, -32601, f"unknown method: {method}")
 
 
-def serve(sessions_root: Path | None = None) -> int:
-    """Newline-delimited JSON-RPC over stdio. NOT LSP Content-Length framing."""
+def _mutations_enabled(explicit: bool | None) -> bool:
+    if explicit is not None:
+        return explicit
+    return os.environ.get(MCP_MUTATION_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def serve(sessions_root: Path | None = None, *, allow_mutating: bool | None = None) -> int:
+    """Newline-delimited JSON-RPC over stdio, read-only by default.
+
+    An operator can opt in to mutating tools through `allow_mutating=True` (the
+    CLI flag) or DROID_RECON_MCP_ALLOW_MUTATIONS=1. The gate is checked on every
+    tools/call request, even if a client bypasses tools/list.
+    """
     global _SESSIONS_ROOT
     if sessions_root:
         _SESSIONS_ROOT = sessions_root
@@ -775,6 +1071,7 @@ def serve(sessions_root: Path | None = None) -> int:
     # Progress output would corrupt the protocol stream — silence it.
     from . import log as log_mod
     log_mod.set_quiet(True)
+    permitted = _mutations_enabled(allow_mutating)
 
     for line in sys.stdin:
         line = line.strip()
@@ -784,7 +1081,7 @@ def serve(sessions_root: Path | None = None) -> int:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        reply = handle(msg)
+        reply = handle(msg, allow_mutating=permitted)
         if reply is not None:
             sys.stdout.write(json.dumps(reply) + "\n")
             sys.stdout.flush()

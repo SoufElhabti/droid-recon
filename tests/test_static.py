@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from droid_recon import report as report_mod
 from droid_recon.models import Observation, SessionState
 from droid_recon.session import Session
 from droid_recon.static import patterns, sweep, urimatcher
@@ -216,6 +217,20 @@ def test_next_finding_id_increments(tmp_path):
         source={}, sink={}, chain=["a", "b", "c"], poc="p", impact="i",
     ))
     assert s.next_finding_id() == "F002"
+
+
+def test_markdown_surfaces_lottie_code_summary():
+    markdown = report_mod.to_markdown({
+        "package": "com.x",
+        "code_summary": {
+            "files_scanned": 7,
+            "lottie_stacks": ["lottie-android", "rlottie"],
+            "lottie_attacker_influenced_delivery": True,
+        },
+    })
+    assert "Lottie stacks: `lottie-android`, `rlottie`" in markdown
+    assert "Attacker-influenced Lottie delivery candidate: yes" in markdown
+    assert "runtime confirmation required" in markdown
 
 
 # ---- floating paths and call() methods ----

@@ -296,14 +296,14 @@ def analyse(so_path: Path, work_dir: Path, *, timeout: int = ANALYZE_TIMEOUT,
     if cache.exists() and not force:
         say("ghidra", f"cache hit for {so_path.name}")
         try:
-            return json.loads(cache.read_text())
+            return json.loads(cache.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             pass
 
     script_dir = work_dir / "scripts"
     script_dir.mkdir(exist_ok=True)
     script = script_dir / "DroidReconExport.java"
-    script.write_text(_POST_SCRIPT_JAVA)
+    script.write_text(_POST_SCRIPT_JAVA, encoding="utf-8")
 
     project_dir = work_dir / "proj"
     project_dir.mkdir(exist_ok=True)
@@ -329,7 +329,7 @@ def analyse(so_path: Path, work_dir: Path, *, timeout: int = ANALYZE_TIMEOUT,
 
     blob["source_file"] = str(so_path)
     blob["findings"] = _interpret(blob)
-    cache.write_text(json.dumps(blob, indent=2))
+    cache.write_text(json.dumps(blob, indent=2), encoding="utf-8")
     ok(f"{so_path.name}: {blob.get('functions_total', 0)} functions, "
        f"{len(blob.get('jni_entry_points', []))} JNI entry points")
     return blob
@@ -386,7 +386,8 @@ def _interpret(blob: dict) -> dict:
     dangerous = [{"symbol": i, "why": _DANGEROUS_IMPORTS[i]}
                  for i in imports if i in _DANGEROUS_IMPORTS]
 
-    secrets, endpoints = [], []
+    secrets: list[dict] = []
+    endpoints: list[dict] = []
     for s in blob.get("strings", []):
         val = s.get("value", "")
         for rx, label in _SECRET_RE:
@@ -440,7 +441,7 @@ def decompile_function(so_path: Path, function: str, work_dir: Path,
         "      }\n"
         "    }\n"
         "  }\n"
-        "}\n")
+        "}\n", encoding="utf-8")
     project_dir = work_dir / "proj"
     project_dir.mkdir(parents=True, exist_ok=True)
     proc = shell.run([
